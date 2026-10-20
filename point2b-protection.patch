@@ -1,351 +1,11 @@
-diff --git a/README.md b/README.md
-index 5f81b1e..57df6bb 100644
---- a/README.md
-+++ b/README.md
-@@ -1 +1,17 @@
- # mavera-api
-+
-+## Paiements : test de bout en bout (bac à sable Stripe)
-+
-+Jamais de clé de production : les scripts refusent toute clé qui ne commence pas par `sk_test_`.
-+
-+1. Copier `supabase/functions/.env.example` en `supabase/functions/.env` et remplir
-+   `STRIPE_SECRET_KEY` (bac à sable), `PUBLIC_SITE_ORIGIN`, et `CAPTCHA_DISABLED=true` en local.
-+2. Créer les prix d'abonnement (une seule fois par grille; sans danger à relancer) :
-+   `deno run --allow-env --allow-net --env-file=supabase/functions/.env scripts/stripe-sandbox-setup.ts`
-+3. Trois terminaux :
-+   - `supabase start` puis `supabase functions serve`
-+   - `stripe listen --forward-to localhost:54321/functions/v1/stripe-webhook`
-+     (copier le `whsec_…` affiché dans `STRIPE_WEBHOOK_SECRET`, puis relancer `functions serve`)
-+   - `deno run -A --env-file=supabase/functions/.env scripts/e2e-checkout.ts depart monthly current`
-+4. Payer sur la page affichée avec la carte `4242 4242 4242 4242`. Le script vérifie Stripe,
-+   la base, puis rejoue l'événement pour confirmer qu'aucun deuxième dossier n'est créé.
-diff --git a/scripts/e2e-checkout.ts b/scripts/e2e-checkout.ts
-new file mode 100644
-index 0000000..a858dd2
---- /dev/null
-+++ b/scripts/e2e-checkout.ts
-@@ -0,0 +1,174 @@
-+/**
-+ * Test de bout en bout : site → public-api → Stripe (bac à sable) → webhook → dossier.
-+ *
-+ * Prérequis (trois terminaux) :
-+ *   1. supabase start   puis   supabase functions serve
-+ *   2. stripe listen --forward-to localhost:54321/functions/v1/stripe-webhook
-+ *   3. deno run -A --env-file=supabase/functions/.env scripts/e2e-checkout.ts [forfait] [option] [mois]
-+ *        ex. scripts/e2e-checkout.ts depart monthly current
-+ *
-+ * Le script crée l'inscription, affiche la page de paiement Stripe (payer avec
-+ * 4242 4242 4242 4242, n'importe quelle date future et n'importe quel CVC),
-+ * attend le webhook, puis vérifie Stripe ET la base, et rejoue l'événement
-+ * pour confirmer qu'aucun deuxième dossier n'est créé.
-+ */
-+import { createClient } from 'npm:@supabase/supabase-js@2.117.2';
-+import { Stripe, stripeClient } from '../supabase/functions/_shared/integrations/stripe/client.ts';
-+import { torontoMidnight } from '../supabase/functions/_shared/integrations/stripe/time.ts';
-+import type { CheckoutQuote } from '../supabase/functions/_shared/domain/pricing/mod.ts';
-+
-+const [planCode = 'depart', billingOption = 'monthly', startMonth = 'current'] = Deno.args;
-+const results: { ok: boolean; label: string; detail?: string }[] = [];
-+const check = (ok: boolean, label: string, detail?: string) => {
-+  results.push({ ok, label, detail });
-+  console.log(`  ${ok ? '✓' : '✗'} ${label}${!ok && detail ? ` — ${detail}` : ''}`);
-+};
-+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-+
-+/** URL et clé service_role : variables d'environnement, sinon `supabase status`. */
-+async function localSupabase(): Promise<{ url: string; serviceKey: string }> {
-+  let url = Deno.env.get('E2E_SUPABASE_URL') ?? '';
-+  let serviceKey = Deno.env.get('E2E_SERVICE_ROLE_KEY') ?? '';
-+  if (!url || !serviceKey) {
-+    const out = await new Deno.Command('supabase', { args: ['status', '-o', 'json'], stdout: 'piped', stderr: 'null' }).output();
-+    if (!out.success) throw new Error('`supabase status` a échoué : Supabase local est-il démarré ?');
-+    const status = JSON.parse(new TextDecoder().decode(out.stdout)) as Record<string, string>;
-+    url ||= status.API_URL;
-+    serviceKey ||= status.SERVICE_ROLE_KEY ?? status.SECRET_KEY;
-+  }
-+  if (!url || !serviceKey) throw new Error('URL ou clé service_role locale introuvable');
-+  if (!/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(url)) throw new Error(`Supabase LOCAL seulement (reçu : ${url})`);
-+  return { url, serviceKey };
-+}
-+
-+async function main() {
-+  if (!(Deno.env.get('STRIPE_SECRET_KEY') ?? '').startsWith('sk_test_')) {
-+    throw new Error('STRIPE_SECRET_KEY doit être une clé de bac à sable (sk_test_…)');
-+  }
-+  const webhookSecret = Deno.env.get('STRIPE_WEBHOOK_SECRET');
-+  const site = Deno.env.get('PUBLIC_SITE_ORIGIN');
-+  if (!webhookSecret || !site) throw new Error('STRIPE_WEBHOOK_SECRET et PUBLIC_SITE_ORIGIN sont requis');
-+  const { url, serviceKey } = await localSupabase();
-+  const db = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
-+  const stripe = stripeClient();
-+  const startedAt = Math.floor(Date.now() / 1000);
-+
-+  // 1. Inscription, comme le site
-+  const attemptId = crypto.randomUUID();
-+  const email = `e2e+${Date.now()}@example.com`;
-+  console.log(`\n1. Inscription ${planCode} / ${billingOption} / ${startMonth} (${email})`);
-+  const res = await fetch(`${url}/functions/v1/public-api/checkout`, {
-+    method: 'POST',
-+    headers: { 'content-type': 'application/json', origin: site },
-+    body: JSON.stringify({
-+      attemptId, email, phone: '514 555 0199', displayName: 'Test bout en bout',
-+      planCode, billingOption, startMonth, booksUpToDate: true, usesQuickbooks: false,
-+      estimatedTransactions: 12,
-+      ...(planCode === 'trajet'
-+        ? { trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 12 } }
-+        : {}),
-+      successUrl: `${site}/merci`, cancelUrl: `${site}/forfaits`,
-+      captchaToken: Deno.env.get('E2E_CAPTCHA_TOKEN') ?? 'XXXX.DUMMY.TOKEN.XXXX',
-+    }),
-+  });
-+  const body = await res.json();
-+  if (res.status !== 200) throw new Error(`public-api a répondu ${res.status} : ${JSON.stringify(body)}`);
-+  const quote = body.quote as CheckoutQuote;
-+  console.log(`   Montant du jour : ${(quote.dueToday.totalCents / 100).toFixed(2)} $, prochain prélèvement le ${quote.recurring.nextChargeOn}`);
-+  console.log(`\n2. Payez sur cette page (carte 4242 4242 4242 4242) :\n\n   ${body.url}\n`);
-+
-+  // 2. Attendre le webhook
-+  type Row = Record<string, unknown>;
-+  let attempt: Row | undefined;
-+  let lastState = '';
-+  for (let i = 0; i < 300; i++) {
-+    const { data, error } = await db.rpc('checkout_attempt_get', { p_id: attemptId });
-+    if (error) throw new Error(`Lecture de la tentative : ${error.message}`);
-+    attempt = (data as Row[])[0];
-+    const state = attempt?.completed_at ? 'terminée' : attempt?.rejected_at ? 'refusée'
-+      : attempt?.paid_at ? 'payée, en traitement' : 'en attente du paiement';
-+    if (state !== lastState) { console.log(`   … ${state}`); lastState = state; }
-+    if (attempt?.completed_at || attempt?.rejected_at) break;
-+    await sleep(3000);
-+  }
-+  if (!attempt?.completed_at) {
-+    throw new Error(attempt?.rejected_at
-+      ? `Inscription refusée : ${attempt.rejection_reason}`
-+      : 'Aucun dossier après 15 minutes : `stripe listen` tourne-t-il ? Voir aussi les journaux de `supabase functions serve`.');
-+  }
-+
-+  // 3. Vérifications chez Stripe
-+  console.log('\n3. Stripe');
-+  const intent = await stripe.paymentIntents.retrieve(String(attempt.stripe_payment_intent_id));
-+  check(intent.amount_received === quote.dueToday.totalCents && intent.currency === 'cad',
-+    `Encaissé : ${(intent.amount_received / 100).toFixed(2)} $ CAD`, `attendu ${quote.dueToday.totalCents} cents`);
-+  const sub = await stripe.subscriptions.retrieve(String(attempt.stripe_subscription_id), { expand: ['latest_invoice'] });
-+  const item = sub.items.data[0];
-+  check(item?.price.lookup_key === quote.terms.stripeRecurringLookupKey && item?.price.unit_amount === quote.recurring.amountCents,
-+    `Abonnement au prix accordé (${quote.terms.stripeRecurringLookupKey})`, `reçu ${item?.price.lookup_key} / ${item?.price.unit_amount}`);
-+  check(sub.billing_cycle_anchor === torontoMidnight(quote.recurring.nextChargeOn),
-+    `Premier prélèvement le ${quote.recurring.nextChargeOn} à minuit (Montréal)`,
-+    `ancrage reçu ${new Date(sub.billing_cycle_anchor * 1000).toISOString()}`);
-+  check(sub.metadata?.attempt_id === attemptId, 'Abonnement relié à la tentative');
-+  const invoice = sub.latest_invoice as Stripe.Invoice | null;
-+  check(!invoice || invoice.amount_paid === 0, 'Rien d\'autre facturé avant le premier prélèvement',
-+    `facture ${invoice?.id} : ${invoice?.amount_paid} cents`);
-+
-+  // 4. Vérifications dans la base
-+  console.log('\n4. Base de données');
-+  check(attempt.paid_amount_cents === quote.dueToday.totalCents, 'Montant payé enregistré');
-+  const { data: subRow } = await db.from('subscriptions')
-+    .select('id, mandate_id, billing_option, starts_on, opening_fee_cents, stripe_status')
-+    .eq('stripe_subscription_id', sub.id).maybeSingle();
-+  check(!!subRow, 'Abonnement enregistré');
-+  check(subRow?.billing_option === billingOption && subRow?.starts_on === quote.startsOn &&
-+    subRow?.opening_fee_cents === quote.terms.openingFeeCents,
-+    `Option, début (${quote.startsOn}) et frais d'ouverture conformes`, JSON.stringify(subRow));
-+  const { data: period } = await db.from('subscription_plan_periods')
-+    .select('plan_code, recurring_price_cents, included_transactions, extra_transaction_cents')
-+    .eq('subscription_id', subRow?.id ?? '').maybeSingle();
-+  check(period?.plan_code === planCode && period?.recurring_price_cents === quote.terms.recurringPriceCents &&
-+    period?.included_transactions === quote.terms.includedTransactions,
-+    'Conditions accordées figées (forfait, prix, transactions incluses)', JSON.stringify(period));
-+  const { data: client } = await db.from('clients').select('id, contact_email, stripe_customer_id')
-+    .eq('stripe_customer_id', String(attempt.stripe_customer_id)).maybeSingle();
-+  check(client?.contact_email === email, 'Client créé avec le bon courriel et le client Stripe');
-+  const { count: invites } = await db.from('invitations').select('id', { count: 'exact', head: true })
-+    .eq('client_id', client?.id ?? '').is('accepted_at', null);
-+  check(invites === 1, 'Invitation à l\'application en attente');
-+
-+  // 5. Rejouer l'événement : aucun deuxième dossier
-+  console.log('\n5. Événement reçu deux fois');
-+  let event: Stripe.Event | undefined;
-+  for await (const e of stripe.events.list({ type: 'checkout.session.completed', created: { gte: startedAt - 60 }, limit: 100 })) {
-+    if ((e.data.object as Stripe.Checkout.Session).id === attempt.stripe_session_id) { event = e; break; }
-+  }
-+  if (!event) {
-+    check(false, 'Événement checkout.session.completed retrouvé chez Stripe');
-+  } else {
-+    const payload = JSON.stringify(event);
-+    const signature = await stripe.webhooks.generateTestHeaderStringAsync({
-+      payload, secret: webhookSecret, cryptoProvider: Stripe.createSubtleCryptoProvider(),
-+    });
-+    const replay = await fetch(`${url}/functions/v1/stripe-webhook`, {
-+      method: 'POST', headers: { 'stripe-signature': signature, 'content-type': 'application/json' }, body: payload,
-+    });
-+    const text = await replay.text();
-+    check(replay.status === 200 && text === 'already_completed', 'Rejoué : reconnu comme déjà traité', `${replay.status} ${text}`);
-+    const { count: subs } = await db.from('subscriptions').select('id', { count: 'exact', head: true })
-+      .eq('mandate_id', subRow?.mandate_id ?? '');
-+    check(subs === 1, 'Toujours un seul abonnement pour ce mandat');
-+  }
-+
-+  const failed = results.filter(r => !r.ok).length;
-+  console.log(`\n${failed ? `✗ ${failed} vérification(s) en échec` : '✓ Parcours complet réussi'} (${results.length} vérifications)`);
-+  console.log(`  Tentative ${attemptId}`);
-+  if (failed) Deno.exit(1);
-+}
-+
-+try {
-+  await main();
-+} catch (error) {
-+  console.error(`\nÉchec : ${error instanceof Error ? error.message : String(error)}`);
-+  Deno.exit(1);
-+}
-diff --git a/scripts/stripe-sandbox-setup.ts b/scripts/stripe-sandbox-setup.ts
-new file mode 100644
-index 0000000..0173235
---- /dev/null
-+++ b/scripts/stripe-sandbox-setup.ts
-@@ -0,0 +1,106 @@
-+/**
-+ * Crée les prix d'abonnement dans le BAC À SABLE Stripe, à partir de domain/pricing.
-+ * Aucun montant n'est recopié à la main : la grille est la seule source.
-+ *
-+ *   deno run --allow-env --allow-net --env-file=supabase/functions/.env scripts/stripe-sandbox-setup.ts
-+ *   (ajouter --dry-run pour seulement afficher ce qui serait créé)
-+ *
-+ * Sans danger à relancer : un prix déjà présent et identique est gardé. Un prix
-+ * présent mais différent arrête le script : changer un prix demande une nouvelle
-+ * version de la grille (GRID_VERSION), jamais une modification en place.
-+ */
-+import { stripeClient, type Stripe } from '../supabase/functions/_shared/integrations/stripe/client.ts';
-+import {
-+  type BillingOption,
-+  GRID_VERSION,
-+  grantTerms,
-+  PLANS,
-+} from '../supabase/functions/_shared/domain/pricing/mod.ts';
-+
-+export interface ExpectedPrice {
-+  lookupKey: string;
-+  planCode: string;
-+  planName: string;
-+  amountCents: number;
-+  interval: 'month' | 'year';
-+}
-+
-+/** Un prix par clé de recherche : le mensuel avec engagement partage le prix du mensuel. */
-+export function expectedRecurringPrices(): ExpectedPrice[] {
-+  const byKey = new Map<string, ExpectedPrice>();
-+  for (const plan of Object.values(PLANS)) {
-+    for (const option of plan.billingOptions as readonly BillingOption[]) {
-+      const t = grantTerms(plan.code, option);
-+      const price = {
-+        lookupKey: t.stripeRecurringLookupKey, planCode: plan.code, planName: plan.name,
-+        amountCents: t.recurringPriceCents, interval: t.cycle,
-+      };
-+      const seen = byKey.get(price.lookupKey);
-+      if (seen && (seen.amountCents !== price.amountCents || seen.interval !== price.interval)) {
-+        throw new Error(`Deux montants pour la même clé : ${price.lookupKey}`);
-+      }
-+      byKey.set(price.lookupKey, price);
-+    }
-+  }
-+  return [...byKey.values()];
-+}
-+
-+async function findProduct(stripe: Stripe, planCode: string): Promise<Stripe.Product | null> {
-+  for await (const product of stripe.products.list({ active: true, limit: 100 })) {
-+    if (product.metadata?.pricing_plan === planCode && product.metadata?.grid_version === GRID_VERSION) return product;
-+  }
-+  return null;
-+}
-+
-+async function main() {
-+  const key = Deno.env.get('STRIPE_SECRET_KEY') ?? '';
-+  if (!key.startsWith('sk_test_')) {
-+    throw new Error('STRIPE_SECRET_KEY doit être une clé de bac à sable (sk_test_…) : aucune clé de production.');
-+  }
-+  const dryRun = Deno.args.includes('--dry-run');
-+  const stripe = stripeClient();
-+  const prices = expectedRecurringPrices();
-+  console.log(`Grille ${GRID_VERSION} : ${prices.length} prix d'abonnement${dryRun ? ' (simulation)' : ''}\n`);
-+
-+  for (const p of prices) {
-+    const label = `${p.lookupKey.padEnd(24)} ${(p.amountCents / 100).toFixed(2).padStart(8)} $ / ${p.interval === 'year' ? 'an' : 'mois'}`;
-+    const found = await stripe.prices.list({ lookup_keys: [p.lookupKey], limit: 10 });
-+    if (found.data.length > 1) throw new Error(`Plusieurs prix pour ${p.lookupKey} : à corriger dans Stripe`);
-+    const existing = found.data[0];
-+    if (existing) {
-+      const same = existing.active && existing.currency === 'cad' && existing.type === 'recurring' &&
-+        existing.unit_amount === p.amountCents && existing.recurring?.interval === p.interval &&
-+        existing.recurring?.interval_count === 1;
-+      if (!same) {
-+        throw new Error(`${p.lookupKey} existe chez Stripe avec d'autres conditions (${existing.id}). ` +
-+          'Ne pas modifier un prix : créer une nouvelle version de la grille.');
-+      }
-+      console.log(`  ✓ ${label}   déjà présent (${existing.id})`);
-+      continue;
-+    }
-+    if (dryRun) { console.log(`  + ${label}   à créer`); continue; }
-+
-+    const product = await findProduct(stripe, p.planCode) ?? await stripe.products.create({
-+      name: `Tenue de livres — ${p.planName}`,
-+      metadata: { pricing_plan: p.planCode, grid_version: GRID_VERSION },
-+    }, { idempotencyKey: `setup:product:${GRID_VERSION}:${p.planCode}` });
-+    const created = await stripe.prices.create({
-+      currency: 'cad', product: product.id, unit_amount: p.amountCents,
-+      recurring: { interval: p.interval, interval_count: 1 },
-+      tax_behavior: 'exclusive',
-+      lookup_key: p.lookupKey,
-+      metadata: { pricing_plan: p.planCode, grid_version: GRID_VERSION },
-+    }, { idempotencyKey: `setup:price:${p.lookupKey}` });
-+    console.log(`  + ${label}   créé (${created.id})`);
-+  }
-+  console.log('\nTerminé. Les montants sont avant taxes (tax_behavior: exclusive).');
-+}
-+
-+if (import.meta.main) {
-+  try {
-+    await main();
-+  } catch (error) {
-+    console.error(`\nÉchec : ${error instanceof Error ? error.message : String(error)}`);
-+    Deno.exit(1);
-+  }
-+}
-diff --git a/supabase/config.toml b/supabase/config.toml
-index 2ab6d3c..fba5d96 100644
---- a/supabase/config.toml
-+++ b/supabase/config.toml
-@@ -386,6 +386,15 @@ deno_version = 2
- # [edge_runtime.secrets]
- # secret_key = "env(SECRET_VALUE)"
- 
-+# API publique du site : appelée sans session; protégée par la liste d'origines
-+# et la vérification stricte de chaque champ.
-+[functions.public-api]
-+verify_jwt = false
-+
-+# Stripe n'envoie pas de jeton Supabase : la signature Stripe est vérifiée à la place.
-+[functions.stripe-webhook]
-+verify_jwt = false
-+
- [analytics]
- enabled = true
- port = 54327
 diff --git a/supabase/functions/.env.example b/supabase/functions/.env.example
-new file mode 100644
-index 0000000..74e7813
---- /dev/null
+index 3540845..74e7813 100644
+--- a/supabase/functions/.env.example
 +++ b/supabase/functions/.env.example
-@@ -0,0 +1,13 @@
-+# Copier en supabase/functions/.env (jamais commité). Clés du BAC À SABLE Stripe seulement.
-+# SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont fournies automatiquement par `supabase start`.
-+STRIPE_SECRET_KEY=sk_test_...
-+# Affiché par : stripe listen --forward-to localhost:54321/functions/v1/stripe-webhook
-+STRIPE_WEBHOOK_SECRET=whsec_...
-+# Origines autorisées à appeler public-api (et adresses de retour après paiement).
-+PUBLIC_SITE_ORIGIN=http://localhost:3000
-+PUBLIC_PORTAL_ORIGIN=http://localhost:5173
+@@ -6,3 +6,8 @@ STRIPE_WEBHOOK_SECRET=whsec_...
+ # Origines autorisées à appeler public-api (et adresses de retour après paiement).
+ PUBLIC_SITE_ORIGIN=http://localhost:3000
+ PUBLIC_PORTAL_ORIGIN=http://localhost:5173
 +# Antirobot Cloudflare Turnstile (obligatoire en production). En local, avec la clé
 +# de test Cloudflare « toujours réussi » : 1x0000000000000000000000000000000AA
 +TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
@@ -423,192 +83,56 @@ index 6c0cb8b..841054d 100644
 +  return attemptId ? { attemptId } : null;
  }
 diff --git a/supabase/functions/_shared/integrations/supabase/repository.ts b/supabase/functions/_shared/integrations/supabase/repository.ts
-new file mode 100644
-index 0000000..2b470f4
---- /dev/null
+index 3eafdcc..2b470f4 100644
+--- a/supabase/functions/_shared/integrations/supabase/repository.ts
 +++ b/supabase/functions/_shared/integrations/supabase/repository.ts
-@@ -0,0 +1,194 @@
-+/**
-+ * CheckoutRepository réel : chaque méthode appelle une fonction SQL de la
-+ * migration 0900 avec la clé service_role (jamais exposée au navigateur).
-+ * Aucune règle ici : les vérifications sont dans les fonctions SQL.
-+ */
-+import { createClient, type SupabaseClient } from 'npm:@supabase/supabase-js@2.117.2';
-+import {
-+  type CheckoutAttempt,
-+  type CheckoutQuote,
-+  type CheckoutRepository,
-+  type Eligibility,
-+  type PaymentProof,
-+  type RefundResult,
+@@ -11,7 +11,8 @@ import {
+   type Eligibility,
+   type PaymentProof,
+   type RefundResult,
+-  type RefundSignal,
 +  type RefundState,
 +  type RefundSync,
-+  SignupError,
-+  type SignupInput,
-+  type StripeSubscriptionRecord,
-+  type SubscriptionState,
-+} from '../../services/ports.ts';
-+
-+/** Sous-ensemble du client Supabase utilisé ici : un faux client suffit pour les tests. */
-+export type RpcClient = Pick<SupabaseClient, 'rpc'>;
-+
-+export function serviceClient(): SupabaseClient {
-+  const url = Deno.env.get('SUPABASE_URL');
-+  const key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-+  if (!url || !key) throw new Error('Configuration Supabase incomplète');
-+  return createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
-+}
-+
-+/** Erreur SQL telle que renvoyée par PostgREST (code = SQLSTATE). Le code est conservé. */
-+export class DatabaseError extends Error {
-+  readonly code: string;
-+  readonly details: string | null;
-+  constructor(fn: string, error: { code?: string; message?: string; details?: string | null }) {
-+    super(`${fn} : ${error.message ?? 'erreur SQL'}`);
-+    this.name = 'DatabaseError';
-+    this.code = error.code ?? '';
-+    this.details = error.details ?? null;
-+  }
-+}
-+
-+/** Refus prévus par checkout_attempt_create, traduits pour le site. */
-+const SIGNUP_CODES: Record<string, ConstructorParameters<typeof SignupError>[0]> = {
-+  P0004: 'not_allowed',
-+  P0005: 'payment_in_progress',
-+  P0006: 'returning_client',
-+};
-+
-+type Row = Record<string, unknown>;
-+const text = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
-+
-+export function mapAttempt(row: Row): CheckoutAttempt {
-+  return {
-+    id: String(row.id),
-+    createdAt: String(row.created_at),
-+    email: String(row.email),
-+    phone: String(row.phone),
-+    displayName: String(row.display_name),
-+    booksUpToDate: row.books_up_to_date === true,
-+    usesQuickbooks: row.uses_quickbooks === true,
-+    estimatedTransactions: Number(row.estimated_transactions),
-+    quote: row.granted_quote as CheckoutQuote,
-+    stripeSessionId: text(row.stripe_session_id),
-+    stripeCustomerId: text(row.stripe_customer_id),
-+    stripePaymentIntentId: text(row.stripe_payment_intent_id),
-+    stripeSubscriptionId: text(row.stripe_subscription_id),
-+    stripePriceId: text(row.stripe_price_id),
-+    stripeStatus: text(row.stripe_status),
-+    paidAmountCents: row.paid_amount_cents === null || row.paid_amount_cents === undefined
-+      ? null : Number(row.paid_amount_cents),
-+    paidAt: text(row.paid_at),
-+    completedAt: text(row.completed_at),
-+    rejectedAt: text(row.rejected_at),
-+    abandonedAt: text(row.abandoned_at),
-+    refundId: text(row.refund_id),
+   SignupError,
+   type SignupInput,
+   type StripeSubscriptionRecord,
+@@ -74,6 +75,7 @@ export function mapAttempt(row: Row): CheckoutAttempt {
+     rejectedAt: text(row.rejected_at),
+     abandonedAt: text(row.abandoned_at),
+     refundId: text(row.refund_id),
 +    requestFingerprint: text(row.request_fingerprint),
-+  };
-+}
-+
-+export class SupabaseCheckoutRepository implements CheckoutRepository {
-+  constructor(private readonly db: RpcClient = serviceClient()) {}
-+
-+  private async call<T>(fn: string, params: Record<string, unknown>): Promise<T> {
-+    const { data, error } = await this.db.rpc(fn, params);
-+    if (error) throw new DatabaseError(fn, error);
-+    return data as T;
-+  }
-+
-+  checkEligibility(email: string, phone: string, customerId?: string) {
-+    return this.call<Eligibility>('check_signup_eligibility', {
-+      p_email: email, p_phone: phone, p_stripe_customer_id: customerId ?? null,
-+    });
-+  }
-+
+   };
+ }
+ 
+@@ -92,13 +94,14 @@ export class SupabaseCheckoutRepository implements CheckoutRepository {
+     });
+   }
+ 
+-  async createAttempt(input: SignupInput, quote: CheckoutQuote) {
 +  async createAttempt(input: SignupInput, quote: CheckoutQuote, requestFingerprint: string) {
-+    try {
-+      await this.call('checkout_attempt_create', {
-+        p_id: input.attemptId, p_email: input.email, p_phone: input.phone,
-+        p_display_name: input.displayName, p_books_up_to_date: input.booksUpToDate,
-+        p_uses_quickbooks: input.usesQuickbooks,
-+        p_estimated_transactions: input.estimatedTransactions, p_quote: quote,
+     try {
+       await this.call('checkout_attempt_create', {
+         p_id: input.attemptId, p_email: input.email, p_phone: input.phone,
+         p_display_name: input.displayName, p_books_up_to_date: input.booksUpToDate,
+         p_uses_quickbooks: input.usesQuickbooks,
+         p_estimated_transactions: input.estimatedTransactions, p_quote: quote,
 +        p_request_fingerprint: requestFingerprint,
-+      });
-+    } catch (error) {
-+      const code = error instanceof DatabaseError ? SIGNUP_CODES[error.code] : undefined;
-+      if (code) throw new SignupError(code);
-+      throw error;
-+    }
-+    const attempt = await this.getAttempt(input.attemptId);
-+    if (!attempt) throw new Error('Tentative non sauvegardée');
-+    return attempt;
-+  }
-+
-+  async getAttempt(attemptId: string) {
-+    const rows = await this.call<Row[]>('checkout_attempt_get', { p_id: attemptId });
-+    return rows && rows.length ? mapAttempt(rows[0]) : null;
-+  }
-+
-+  openAttemptFor(email: string) {
-+    return this.call<string | null>('checkout_attempt_open_for', { p_email: email });
-+  }
-+
-+  async abandon(attemptId: string) {
-+    await this.call('checkout_attempt_abandon', { p_id: attemptId });
-+  }
-+
-+  async saveSession(attemptId: string, sessionId: string) {
-+    await this.call('checkout_attempt_save_session', { p_id: attemptId, p_session_id: sessionId });
-+  }
-+
-+  claim(attemptId: string, token: string) {
-+    return this.call<boolean>('checkout_attempt_claim', { p_id: attemptId, p_token: token });
-+  }
-+
-+  async savePayment(attemptId: string, token: string, proof: PaymentProof) {
-+    await this.call('checkout_attempt_paid', {
-+      p_id: attemptId, p_token: token, p_session_id: proof.sessionId,
-+      p_customer_id: proof.customerId, p_intent_id: proof.paymentIntentId,
-+      p_method_id: proof.paymentMethodId, p_amount_cents: proof.amountPaidCents,
-+    });
-+  }
-+
-+  async saveSubscription(attemptId: string, token: string, subscription: StripeSubscriptionRecord) {
-+    await this.call('checkout_attempt_subscription', {
-+      p_id: attemptId, p_token: token, p_subscription_id: subscription.subscriptionId,
-+      p_price_id: subscription.priceId, p_status: subscription.status,
-+    });
-+  }
-+
-+  complete(attemptId: string, token: string, eventId: string, invitationExpiresAt: string) {
-+    return this.call<string | null>('checkout_attempt_finish', {
-+      p_id: attemptId, p_token: token, p_event_id: eventId, p_invitation_expires_at: invitationExpiresAt,
-+    });
-+  }
-+
-+  async reject(attemptId: string, token: string, refund: RefundResult, reason: string) {
-+    await this.call('checkout_attempt_reject', {
-+      p_id: attemptId, p_token: token, p_refund_id: refund.refundId,
-+      p_refund_amount_cents: refund.amountCents, p_refund_status: refund.status, p_reason: reason,
-+    });
-+  }
-+
-+  async release(attemptId: string, token: string) {
-+    await this.call('checkout_attempt_release', { p_id: attemptId, p_token: token });
-+  }
-+
-+  applySubscriptionState(state: SubscriptionState) {
-+    return this.call<boolean>('apply_stripe_subscription_state', {
-+      p_event_id: state.eventId, p_type: state.type, p_subscription_id: state.subscriptionId,
-+      p_status: state.status, p_read_at: state.readAt,
-+    });
-+  }
-+
+       });
+     } catch (error) {
+       const code = error instanceof DatabaseError ? SIGNUP_CODES[error.code] : undefined;
+@@ -170,9 +173,22 @@ export class SupabaseCheckoutRepository implements CheckoutRepository {
+     });
+   }
+ 
+-  updateRefundStatus(signal: RefundSignal) {
+-    return this.call<boolean>('checkout_attempt_refund_status', {
+-      p_refund_id: signal.refundId, p_status: signal.status,
 +  updateRefundStatus(state: RefundState) {
 +    return this.call<RefundSync>('checkout_attempt_refund_status', {
 +      p_attempt_id: state.attemptId, p_refund_id: state.refundId, p_status: state.status,
-+    });
-+  }
-+}
+     });
+   }
+ }
 +
 +/** Limite d'appels de l'API publique (fenêtre fixe, clé hachée dans la base). */
 +export class SupabaseRateLimiter {
@@ -661,33 +185,22 @@ index 0000000..0486cfd
 +  }
 +}
 diff --git a/supabase/functions/_shared/services/ports.ts b/supabase/functions/_shared/services/ports.ts
-index 6badaa2..cd99611 100644
+index 4d7e1e8..cd99611 100644
 --- a/supabase/functions/_shared/services/ports.ts
 +++ b/supabase/functions/_shared/services/ports.ts
-@@ -32,13 +32,21 @@ export class BillingTerminalError extends Error {
-  * - returning_client : ancien client → réouverture par l'application, où il est authentifié
+@@ -33,8 +33,10 @@ export class BillingTerminalError extends Error {
   * - not_allowed : dossier déjà ouvert, ou client refusé définitivement
   * - payment_in_progress : un paiement pour ce courriel est en cours de traitement
-+ * - attempt_expired : la tentative ne peut plus être payée; le site recommence avec un nouvel identifiant
+  * - attempt_expired : la tentative ne peut plus être payée; le site recommence avec un nouvel identifiant
 + * - attempt_conflict : même identifiant avec d'autres choix; le site recommence avec un nouvel identifiant
   */
--export type SignupErrorCode = 'returning_client' | 'not_allowed' | 'payment_in_progress';
+-export type SignupErrorCode = 'returning_client' | 'not_allowed' | 'payment_in_progress' | 'attempt_expired';
 +export type SignupErrorCode =
 +  | 'returning_client' | 'not_allowed' | 'payment_in_progress' | 'attempt_expired' | 'attempt_conflict';
  export class SignupError extends Error {
    readonly code: SignupErrorCode;
    constructor(code: SignupErrorCode) { super(code); this.name = 'SignupError'; this.code = code; }
- }
- 
-+/** Demande mal formée (champ manquant ou invalide) : jamais une panne. */
-+export class InvalidRequestError extends Error {
-+  constructor(message: string) { super(message); this.name = 'InvalidRequestError'; }
-+}
-+
- export interface PaymentProof {
-   sessionId: string;
-   attemptId: string;
-@@ -79,6 +87,8 @@ export interface CheckoutAttempt {
+@@ -85,6 +87,8 @@ export interface CheckoutAttempt {
    rejectedAt: string | null;
    abandonedAt: string | null;
    refundId: string | null;
@@ -696,7 +209,7 @@ index 6badaa2..cd99611 100644
  }
  
  /** Signal d'un événement d'abonnement : l'état réel est relu chez Stripe. */
-@@ -90,7 +100,11 @@ export interface SubscriptionSignal {
+@@ -96,7 +100,11 @@ export interface SubscriptionSignal {
  }
  /** État d'abonnement lu chez Stripe, avec l'heure du début de la lecture. */
  export interface SubscriptionState extends SubscriptionSignal { status: string; readAt: string }
@@ -709,7 +222,7 @@ index 6badaa2..cd99611 100644
  
  /** Ce que donne la tentative d'expirer une session de paiement chez Stripe. */
  export type SessionExpiry = 'expired' | 'already_expired' | 'completed';
-@@ -125,11 +139,12 @@ export interface BillingGateway {
+@@ -131,11 +139,12 @@ export interface BillingGateway {
    refund(input: { attemptId: string; paymentIntentId: string; amountCents: number; reason: string }): Promise<RefundResult>;
    cancelSubscription(subscriptionId: string, attemptId: string): Promise<void>;
    getSubscriptionStatus(subscriptionId: string): Promise<{ status: string; readAt: string }>;
@@ -723,7 +236,7 @@ index 6badaa2..cd99611 100644
    getAttempt(attemptId: string): Promise<CheckoutAttempt | null>;
    /** Tentative ouverte (ni terminée, ni refusée, ni abandonnée) pour un courriel. */
    openAttemptFor(email: string): Promise<string | null>;
-@@ -143,5 +158,5 @@ export interface CheckoutRepository {
+@@ -149,5 +158,5 @@ export interface CheckoutRepository {
    reject(attemptId: string, token: string, refund: RefundResult, reason: string): Promise<void>;
    release(attemptId: string, token: string): Promise<void>;
    applySubscriptionState(state: SubscriptionState): Promise<boolean>;
@@ -731,51 +244,11 @@ index 6badaa2..cd99611 100644
 +  updateRefundStatus(state: RefundState): Promise<RefundSync>;
  }
 diff --git a/supabase/functions/_shared/services/start-checkout.ts b/supabase/functions/_shared/services/start-checkout.ts
-index 3947a26..856d326 100644
+index 9ea9a39..856d326 100644
 --- a/supabase/functions/_shared/services/start-checkout.ts
 +++ b/supabase/functions/_shared/services/start-checkout.ts
-@@ -1,19 +1,23 @@
- import { quoteCheckout, type CheckoutQuote } from '../domain/pricing/mod.ts';
--import { type BillingGateway, type CheckoutRepository, SignupError, type SignupInput } from './ports.ts';
-+import { type BillingGateway, type CheckoutRepository, InvalidRequestError, SignupError, type SignupInput } from './ports.ts';
- 
- const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
- 
--export function prepareQuote(input: SignupInput, today: string): CheckoutQuote {
-+/** Choix nécessaires au calcul : sert aussi au récapitulatif affiché avant le paiement. */
-+export type QuoteRequest = Pick<SignupInput,
-+  'planCode' | 'billingOption' | 'startMonth' | 'trajetProfile' | 'estimatedTransactions'>;
-+
-+export function prepareQuote(input: QuoteRequest, today: string): CheckoutQuote {
-   if (input.planCode === 'trajet') {
-     const p = input.trajetProfile;
-     if (!p || typeof p.platformIncomeOnly !== 'boolean' ||
-         typeof p.issuesClientInvoices !== 'boolean' ||
-         !Number.isSafeInteger(p.accounts) || p.accounts < 1 ||
-         !Number.isSafeInteger(p.monthlyTransactions) || p.monthlyTransactions < 0) {
--      throw new Error('Les quatre critères Trajet sont obligatoires et doivent être valides');
-+      throw new InvalidRequestError('Les quatre critères Trajet sont obligatoires et doivent être valides');
-     }
-     if (p.monthlyTransactions !== input.estimatedTransactions) {
--      throw new Error('Le nombre de transactions Trajet est incohérent');
-+      throw new InvalidRequestError('Le nombre de transactions Trajet est incohérent');
-     }
-   }
-   // quoteCheckout vérifie l'admissibilité à Trajet (PricingError not_eligible).
-@@ -28,27 +32,27 @@ export async function startCheckout(
-   deps: { billing: BillingGateway; repository: CheckoutRepository },
-   today: string,
- ): Promise<{ sessionId: string; url: string; attemptId: string; quote: CheckoutQuote }> {
--  if (!UUID.test(input.attemptId)) throw new Error('Identifiant de tentative UUID requis');
--  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) throw new Error('Courriel invalide');
--  if (!input.phone.trim() || !input.displayName.trim()) throw new Error('Coordonnées requises');
-+  if (typeof input.attemptId !== 'string' || !UUID.test(input.attemptId)) throw new InvalidRequestError('Identifiant de tentative UUID requis');
-+  if (typeof input.email !== 'string' || input.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) throw new InvalidRequestError('Courriel invalide');
-+  if (typeof input.phone !== 'string' || typeof input.displayName !== 'string' ||
-+      !input.phone.trim() || !input.displayName.trim()) throw new InvalidRequestError('Coordonnées requises');
-   if (!Number.isSafeInteger(input.estimatedTransactions) || input.estimatedTransactions < 0) {
--    throw new Error('Nombre de transactions invalide');
-+    throw new InvalidRequestError('Nombre de transactions invalide');
+@@ -40,12 +40,11 @@ export async function startCheckout(
+     throw new InvalidRequestError('Nombre de transactions invalide');
    }
    const normalizedInput = { ...input, email: input.email.trim().toLowerCase() };
 +  const fingerprint = await requestFingerprint(normalizedInput);
@@ -783,24 +256,14 @@ index 3947a26..856d326 100644
    if (existing) {
 -    if (existing.email !== normalizedInput.email || existing.quote.terms.planCode !== input.planCode ||
 -        existing.quote.terms.billingOption !== input.billingOption) {
--      throw new Error('Tentative déjà réservée à une autre demande');
+-      throw new InvalidRequestError('Tentative déjà réservée à une autre demande');
 -    }
 +    // Tous les choix doivent être identiques : sinon, nouvelle tentative (nouvel identifiant).
 +    if (existing.requestFingerprint !== fingerprint) throw new SignupError('attempt_conflict');
      if (existing.stripeSessionId) {
        const session = await deps.billing.getCheckoutSession(existing.stripeSessionId);
--      if (!session.url) throw new Error('Session Stripe expirée : nouvelle tentative nécessaire');
-+      if (!session.url) throw new SignupError('attempt_expired');
-       return { ...session, url: session.url, attemptId: input.attemptId, quote: existing.quote };
-     }
-     // Après 23 heures, ne plus relancer un appel Stripe dont l'idempotence peut avoir expiré.
-     if (Date.now() - Date.parse(existing.createdAt) > 23 * 3600_000) {
--      throw new Error('Tentative non finalisée : réconciliation nécessaire avant reprise');
-+      throw new SignupError('attempt_expired');
-     }
-   } else {
-     const eligibility = await deps.repository.checkEligibility(normalizedInput.email, input.phone);
-@@ -65,7 +69,7 @@ export async function startCheckout(
+       if (!session.url) throw new SignupError('attempt_expired');
+@@ -70,7 +69,7 @@ export async function startCheckout(
    if (lines.length === 0 || lines.some(line => !Number.isSafeInteger(line.amountCents) || line.amountCents < 0) ||
        lines.reduce((sum, line) => sum + line.amountCents, 0) !== quote.dueToday.totalCents ||
        quote.dueToday.totalCents <= 0) throw new Error('Récapitulatif invalide');
@@ -809,7 +272,7 @@ index 3947a26..856d326 100644
    // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
    const result = await deps.billing.createCheckoutSession({
      attemptId: input.attemptId, email: normalizedInput.email, lines,
-@@ -76,6 +80,22 @@ export async function startCheckout(
+@@ -81,6 +80,22 @@ export async function startCheckout(
    return { ...result, attemptId: input.attemptId, quote };
  }
  
@@ -880,13 +343,14 @@ index e9fe58f..327ed0d 100644
 +  return 'abandoned';
  }
 diff --git a/supabase/functions/public-api/handler.ts b/supabase/functions/public-api/handler.ts
-new file mode 100644
-index 0000000..f40674a
---- /dev/null
+index 2329737..f40674a 100644
+--- a/supabase/functions/public-api/handler.ts
 +++ b/supabase/functions/public-api/handler.ts
-@@ -0,0 +1,301 @@
-+/**
-+ * API publique du site : récapitulatif (/quote) et paiement (/checkout).
+@@ -1,9 +1,18 @@
+ /**
+  * API publique du site : récapitulatif (/quote) et paiement (/checkout).
+- * Chaque refus a un code stable et un message en français pour le site;
+- * une panne ne donne jamais de détail technique au visiteur.
 + *
 + * /quote est un simple calcul : public, sans base ni Stripe.
 + * /checkout crée des ressources Stripe : la vérification d'origine ne suffit pas
@@ -897,106 +361,103 @@ index 0000000..f40674a
 + * panne ne donne jamais de détail technique au visiteur. Le site ne révèle pas
 + * si un courriel est déjà client : ancien client et inscription refusée
 + * reçoivent le même message.
-+ */
-+import { PricingError } from '../_shared/domain/pricing/mod.ts';
+  */
+ import { PricingError } from '../_shared/domain/pricing/mod.ts';
 +import type { HumanCheck } from '../_shared/integrations/turnstile/verify.ts';
-+import {
-+  BillingTerminalError,
-+  type BillingGateway,
-+  type CheckoutRepository,
-+  InvalidRequestError,
-+  SignupError,
-+  type SignupInput,
-+} from '../_shared/services/ports.ts';
-+import { prepareQuote, type QuoteRequest, startCheckout } from '../_shared/services/start-checkout.ts';
-+
+ import {
+   BillingTerminalError,
+   type BillingGateway,
+@@ -14,9 +23,17 @@ import {
+ } from '../_shared/services/ports.ts';
+ import { prepareQuote, type QuoteRequest, startCheckout } from '../_shared/services/start-checkout.ts';
+ 
 +export interface RateLimiter {
 +  /** true si l'appel est permis (et le compte), false si la limite est atteinte. */
 +  allow(key: string, limit: number, windowSeconds: number): Promise<boolean>;
 +}
 +
-+export interface PublicApiDeps {
-+  /** Créés seulement pour /checkout : /quote n'a besoin ni de Stripe ni de la base. */
-+  checkoutDeps(): { billing: BillingGateway; repository: CheckoutRepository };
+ export interface PublicApiDeps {
+   /** Créés seulement pour /checkout : /quote n'a besoin ni de Stripe ni de la base. */
+   checkoutDeps(): { billing: BillingGateway; repository: CheckoutRepository };
 +  rateLimiter(): RateLimiter;
 +  /** null : vérification antirobot désactivée (développement local seulement). */
 +  humanCheck: HumanCheck | null;
-+  /** Jour courant à Montréal (AAAA-MM-JJ). */
-+  today(): string;
-+  /** Origines autorisées (site vitrine, application). */
-+  allowedOrigins: readonly string[];
-+}
-+
-+const MAX_BODY = 16_384;
+   /** Jour courant à Montréal (AAAA-MM-JJ). */
+   today(): string;
+   /** Origines autorisées (site vitrine, application). */
+@@ -24,11 +41,17 @@ export interface PublicApiDeps {
+ }
+ 
+ const MAX_BODY = 16_384;
 +/** Limites de /checkout : par adresse IP, puis par courriel. */
 +export const LIMITS = {
 +  ip: { limit: 20, windowSeconds: 3600 },
 +  email: { limit: 5, windowSeconds: 3600 },
 +} as const;
-+
-+export type ApiErrorCode =
-+  | 'invalid_request' | 'not_found' | 'method_not_allowed' | 'origin_refused' | 'body_too_large'
+ 
+ export type ApiErrorCode =
+   | 'invalid_request' | 'not_found' | 'method_not_allowed' | 'origin_refused' | 'body_too_large'
 +  | 'too_many_requests' | 'human_check_failed'
-+  | 'trajet_not_eligible' | 'plan_not_purchasable' | 'billing_not_offered'
+   | 'trajet_not_eligible' | 'plan_not_purchasable' | 'billing_not_offered'
+-  | 'returning_client' | 'not_allowed' | 'payment_in_progress' | 'attempt_expired'
 +  | 'cannot_signup_online' | 'payment_in_progress' | 'attempt_expired' | 'attempt_conflict'
-+  | 'checkout_window_closed' | 'unavailable';
-+
-+const MESSAGES: Record<ApiErrorCode, string> = {
-+  invalid_request: 'Certaines informations sont manquantes ou invalides.',
-+  not_found: 'Adresse inconnue.',
-+  method_not_allowed: 'Méthode non permise.',
-+  origin_refused: 'Origine non autorisée.',
-+  body_too_large: 'Demande trop volumineuse.',
+   | 'checkout_window_closed' | 'unavailable';
+ 
+ const MESSAGES: Record<ApiErrorCode, string> = {
+@@ -37,33 +60,42 @@ const MESSAGES: Record<ApiErrorCode, string> = {
+   method_not_allowed: 'Méthode non permise.',
+   origin_refused: 'Origine non autorisée.',
+   body_too_large: 'Demande trop volumineuse.',
+-  trajet_not_eligible: 'Votre situation ne correspond pas au forfait Trajet. Le forfait Départ est fait pour vous.',
 +  too_many_requests: 'Trop de tentatives. Patientez un moment avant de réessayer.',
 +  human_check_failed: 'La vérification de sécurité a échoué. Rechargez la page et réessayez.',
 +  trajet_not_eligible: 'Votre situation ne correspond pas aux critères du forfait Trajet. Comparez les autres forfaits pour trouver celui qui vous convient.',
-+  plan_not_purchasable: 'Ce forfait se fait sur soumission : écrivez-nous pour en discuter.',
-+  billing_not_offered: 'Cette option de paiement n\'est pas offerte pour ce forfait.',
+   plan_not_purchasable: 'Ce forfait se fait sur soumission : écrivez-nous pour en discuter.',
+   billing_not_offered: 'Cette option de paiement n\'est pas offerte pour ce forfait.',
+-  returning_client: 'Vous avez déjà un dossier chez nous. Connectez-vous à votre espace client pour le réactiver.',
+-  not_allowed: 'Nous ne pouvons pas traiter cette inscription en ligne. Écrivez-nous et nous vous répondrons rapidement.',
 +  cannot_signup_online: 'Nous ne pouvons pas finaliser cette inscription en ligne. Si vous avez déjà un dossier chez nous, connectez-vous à votre espace client. Sinon, écrivez-nous et nous vous répondrons rapidement.',
-+  payment_in_progress: 'Un paiement est déjà en traitement pour ce courriel. Surveillez vos courriels : la confirmation arrive dans quelques minutes.',
-+  attempt_expired: 'Cette page de paiement a expiré. Recommencez l\'inscription pour obtenir une nouvelle page.',
+   payment_in_progress: 'Un paiement est déjà en traitement pour ce courriel. Surveillez vos courriels : la confirmation arrive dans quelques minutes.',
+   attempt_expired: 'Cette page de paiement a expiré. Recommencez l\'inscription pour obtenir une nouvelle page.',
 +  attempt_conflict: 'Vos choix ont changé depuis l\'ouverture de la page de paiement. Recommencez l\'inscription.',
-+  checkout_window_closed: 'Les paiements sont fermés pendant la dernière demi-heure du mois. Réessayez après minuit.',
-+  unavailable: 'Le service est momentanément indisponible. Réessayez dans quelques minutes.',
-+};
-+
-+const STATUS: Record<ApiErrorCode, number> = {
-+  invalid_request: 400, not_found: 404, method_not_allowed: 405, origin_refused: 403, body_too_large: 413,
+   checkout_window_closed: 'Les paiements sont fermés pendant la dernière demi-heure du mois. Réessayez après minuit.',
+   unavailable: 'Le service est momentanément indisponible. Réessayez dans quelques minutes.',
+ };
+ 
+ const STATUS: Record<ApiErrorCode, number> = {
+   invalid_request: 400, not_found: 404, method_not_allowed: 405, origin_refused: 403, body_too_large: 413,
 +  too_many_requests: 429, human_check_failed: 403,
-+  trajet_not_eligible: 422, plan_not_purchasable: 422, billing_not_offered: 422,
+   trajet_not_eligible: 422, plan_not_purchasable: 422, billing_not_offered: 422,
+-  returning_client: 409, not_allowed: 409, payment_in_progress: 409, attempt_expired: 410,
 +  cannot_signup_online: 409, payment_in_progress: 409, attempt_expired: 410, attempt_conflict: 409,
-+  checkout_window_closed: 409, unavailable: 503,
-+};
-+
-+class ApiError extends Error {
+   checkout_window_closed: 409, unavailable: 503,
+ };
+ 
+ class ApiError extends Error {
+-  constructor(readonly code: ApiErrorCode, readonly details: readonly string[] = []) { super(code); }
 +  constructor(readonly code: ApiErrorCode, readonly details: readonly string[] = [], readonly retryAfter?: number) {
 +    super(code);
 +  }
-+}
-+
-+/** Traduit toute erreur en code d'API. Ce qui n'est pas prévu est une panne. */
-+export function toApiError(error: unknown): ApiError {
-+  if (error instanceof ApiError) return error;
-+  if (error instanceof InvalidRequestError) return new ApiError('invalid_request');
+ }
+ 
+ /** Traduit toute erreur en code d'API. Ce qui n'est pas prévu est une panne. */
+ export function toApiError(error: unknown): ApiError {
+   if (error instanceof ApiError) return error;
+   if (error instanceof InvalidRequestError) return new ApiError('invalid_request');
+-  if (error instanceof SignupError) return new ApiError(error.code);
 +  if (error instanceof SignupError) {
 +    // Même réponse pour un ancien client et un refus : le site ne révèle pas qui est client.
 +    return new ApiError(error.code === 'returning_client' || error.code === 'not_allowed'
 +      ? 'cannot_signup_online' : error.code);
 +  }
-+  if (error instanceof BillingTerminalError && error.reason === 'checkout_window_closed') {
-+    return new ApiError('checkout_window_closed');
-+  }
-+  if (error instanceof PricingError) {
-+    switch (error.code) {
-+      case 'not_eligible': return new ApiError('trajet_not_eligible', error.details);
-+      case 'plan_not_purchasable': return new ApiError('plan_not_purchasable');
-+      case 'billing_not_offered': return new ApiError('billing_not_offered');
-+      case 'invalid_input': return new ApiError('invalid_request');
-+    }
-+  }
-+  return new ApiError('unavailable');
-+}
-+
+   if (error instanceof BillingTerminalError && error.reason === 'checkout_window_closed') {
+     return new ApiError('checkout_window_closed');
+   }
+@@ -78,7 +110,30 @@ export function toApiError(error: unknown): ApiError {
+   return new ApiError('unavailable');
+ }
+ 
+-// ---------- Lecture stricte du corps : chaque champ est vérifié, rien n'est pris tel quel.
 +// ---------- Lecture du corps : taille bornée avant lecture, puis chaque champ vérifié.
 +
 +async function readBody(request: Request): Promise<string> {
@@ -1021,75 +482,13 @@ index 0000000..f40674a
 +  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
 +  return new TextDecoder().decode(bytes);
 +}
-+
-+const str = (body: Record<string, unknown>, key: string, max = 200): string => {
-+  const v = body[key];
-+  if (typeof v !== 'string' || !v.trim() || v.length > max) throw new InvalidRequestError(`${key} invalide`);
-+  return v.trim();
-+};
-+const bool = (body: Record<string, unknown>, key: string): boolean => {
-+  const v = body[key];
-+  if (typeof v !== 'boolean') throw new InvalidRequestError(`${key} invalide`);
-+  return v;
-+};
-+const int = (body: Record<string, unknown>, key: string): number => {
-+  const v = body[key];
-+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0 || v > 100_000) {
-+    throw new InvalidRequestError(`${key} invalide`);
-+  }
-+  return v;
-+};
-+const oneOf = <T extends string>(body: Record<string, unknown>, key: string, values: readonly T[]): T => {
-+  const v = body[key];
-+  if (typeof v !== 'string' || !values.includes(v as T)) throw new InvalidRequestError(`${key} invalide`);
-+  return v as T;
-+};
-+
-+function parseQuote(body: Record<string, unknown>): QuoteRequest {
-+  const profile = body.trajetProfile;
-+  let trajetProfile: QuoteRequest['trajetProfile'];
-+  if (profile !== undefined && profile !== null) {
-+    if (typeof profile !== 'object' || Array.isArray(profile)) throw new InvalidRequestError('trajetProfile invalide');
-+    const p = profile as Record<string, unknown>;
-+    trajetProfile = {
-+      platformIncomeOnly: bool(p, 'platformIncomeOnly'),
-+      issuesClientInvoices: bool(p, 'issuesClientInvoices'),
-+      accounts: int(p, 'accounts'),
-+      monthlyTransactions: int(p, 'monthlyTransactions'),
-+    };
-+  }
-+  return {
-+    planCode: str(body, 'planCode', 40),
-+    billingOption: oneOf(body, 'billingOption', ['monthly', 'monthly_commitment', 'annual'] as const),
-+    startMonth: oneOf(body, 'startMonth', ['current', 'next'] as const),
-+    estimatedTransactions: int(body, 'estimatedTransactions'),
-+    trajetProfile,
-+  };
-+}
-+
-+function parseSignup(body: Record<string, unknown>, origins: readonly string[]): SignupInput {
-+  const redirect = (key: string): string => {
-+    const value = str(body, key, 2000);
-+    let url: URL;
-+    try { url = new URL(value); } catch { throw new InvalidRequestError(`${key} invalide`); }
-+    if (!origins.includes(url.origin) || url.username || url.password) {
-+      throw new InvalidRequestError(`${key} non autorisée`);
-+    }
-+    return url.toString();
-+  };
-+  return {
-+    ...parseQuote(body),
-+    attemptId: str(body, 'attemptId', 36),
-+    email: str(body, 'email', 254),
-+    phone: str(body, 'phone', 40),
-+    displayName: str(body, 'displayName', 200),
-+    booksUpToDate: bool(body, 'booksUpToDate'),
-+    usesQuickbooks: bool(body, 'usesQuickbooks'),
-+    successUrl: redirect('successUrl'),
-+    cancelUrl: redirect('cancelUrl'),
-+  };
-+}
-+
+ 
+ const str = (body: Record<string, unknown>, key: string, max = 200): string => {
+   const v = body[key];
+@@ -148,15 +203,31 @@ function parseSignup(body: Record<string, unknown>, origins: readonly string[]):
+   };
+ }
+ 
 +/** Adresse IP du visiteur, telle que transmise par la passerelle Supabase. */
 +function clientIp(request: Request): string | null {
 +  const forwarded = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
@@ -1102,104 +501,80 @@ index 0000000..f40674a
 +  }
 +}
 +
-+// ---------- Réponses
-+
-+function cors(origin: string, origins: readonly string[]): Record<string, string> {
-+  return origins.includes(origin) ? { 'access-control-allow-origin': origin, vary: 'origin' } : { vary: 'origin' };
-+}
+ // ---------- Réponses
+ 
+ function cors(origin: string, origins: readonly string[]): Record<string, string> {
+   return origins.includes(origin) ? { 'access-control-allow-origin': origin, vary: 'origin' } : { vary: 'origin' };
+ }
+-function json(body: unknown, status: number, origin: string, origins: readonly string[]): Response {
 +function json(body: unknown, status: number, origin: string, origins: readonly string[],
 +  extra: Record<string, string> = {}): Response {
-+  return new Response(JSON.stringify(body), {
-+    status,
+   return new Response(JSON.stringify(body), {
+     status,
+-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...cors(origin, origins) },
 +    headers: {
 +      'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store',
 +      ...cors(origin, origins), ...extra,
 +    },
-+  });
-+}
-+function errorResponse(error: ApiError, origin: string, origins: readonly string[]): Response {
-+  const body = {
-+    error: {
-+      code: error.code, message: MESSAGES[error.code],
-+      ...(error.details.length ? { details: error.details } : {}),
-+    },
-+  };
+   });
+ }
+ function errorResponse(error: ApiError, origin: string, origins: readonly string[]): Response {
+@@ -166,7 +237,8 @@ function errorResponse(error: ApiError, origin: string, origins: readonly string
+       ...(error.details.length ? { details: error.details } : {}),
+     },
+   };
+-  return json(body, STATUS[error.code], origin, origins);
 +  return json(body, STATUS[error.code], origin, origins,
 +    error.retryAfter ? { 'retry-after': String(error.retryAfter) } : {});
-+}
-+
-+export async function handlePublicApi(request: Request, deps: PublicApiDeps): Promise<Response> {
-+  const origins = deps.allowedOrigins;
-+  const origin = request.headers.get('origin') ?? '';
-+  if (request.method === 'OPTIONS') {
-+    return new Response(null, {
-+      status: 204,
-+      headers: {
-+        ...cors(origin, origins),
-+        'access-control-allow-headers': 'authorization, apikey, content-type, x-client-info',
-+        'access-control-allow-methods': 'POST, OPTIONS',
-+        'access-control-max-age': '600',
-+      },
-+    });
-+  }
-+  const route = new URL(request.url).pathname.split('/').filter(Boolean).at(-1);
-+  try {
-+    if (request.method !== 'POST') throw new ApiError('method_not_allowed');
-+    if (!origins.length) throw new Error('Origines autorisées non configurées');
-+    if (route !== 'quote' && route !== 'checkout') throw new ApiError('not_found');
+ }
+ 
+ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Promise<Response> {
+@@ -187,12 +259,15 @@ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Pr
+   try {
+     if (request.method !== 'POST') throw new ApiError('method_not_allowed');
+     if (!origins.length) throw new Error('Origines autorisées non configurées');
+-    // Un navigateur envoie toujours Origin sur un POST : une origine inconnue est refusée.
+-    if (origin && !origins.includes(origin)) throw new ApiError('origin_refused');
+     if (route !== 'quote' && route !== 'checkout') throw new ApiError('not_found');
 +    // /checkout : l'origine est obligatoire (un navigateur l'envoie toujours sur un POST).
 +    if ((route === 'checkout' || origin) && !origins.includes(origin)) throw new ApiError('origin_refused');
-+
+ 
+-    const raw = await request.text();
+-    if (new TextEncoder().encode(raw).length > MAX_BODY) throw new ApiError('body_too_large');
 +    const ip = clientIp(request);
 +    // Compté avant toute lecture : un envoi massif de requêtes invalides est aussi limité.
 +    if (route === 'checkout') await enforce(deps.rateLimiter(), `checkout:ip:${ip ?? 'inconnue'}`, LIMITS.ip);
 +
 +    const raw = await readBody(request);
-+    let body: unknown;
-+    try { body = JSON.parse(raw); } catch { throw new ApiError('invalid_request'); }
-+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError('invalid_request');
-+    const fields = body as Record<string, unknown>;
-+
-+    if (route === 'quote') {
-+      return json({ quote: prepareQuote(parseQuote(fields), deps.today()) }, 200, origin, origins);
-+    }
-+    const input = parseSignup(fields, origins);
+     let body: unknown;
+     try { body = JSON.parse(raw); } catch { throw new ApiError('invalid_request'); }
+     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError('invalid_request');
+@@ -202,6 +277,11 @@ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Pr
+       return json({ quote: prepareQuote(parseQuote(fields), deps.today()) }, 200, origin, origins);
+     }
+     const input = parseSignup(fields, origins);
 +    if (deps.humanCheck) {
 +      const token = typeof fields.captchaToken === 'string' ? fields.captchaToken : '';
 +      if (!await deps.humanCheck.verify(token, ip)) throw new ApiError('human_check_failed');
 +    }
 +    await enforce(deps.rateLimiter(), `checkout:email:${input.email.toLowerCase()}`, LIMITS.email);
-+    const result = await startCheckout(input, deps.checkoutDeps(), deps.today());
-+    return json({ attemptId: result.attemptId, url: result.url, quote: result.quote }, 200, origin, origins);
-+  } catch (error) {
-+    const apiError = toApiError(error);
-+    if (apiError.code === 'unavailable') {
-+      console.error('public-api : panne', route, error instanceof Error ? `${error.name}: ${error.message}` : String(error));
-+    }
-+    return errorResponse(apiError, origin, origins);
-+  }
-+}
-+
-+/** Jour courant à Montréal, au format AAAA-MM-JJ. */
-+export function montrealToday(now = new Date()): string {
-+  return new Intl.DateTimeFormat('en-CA', {
-+    timeZone: 'America/Toronto', year: 'numeric', month: '2-digit', day: '2-digit',
-+  }).format(now);
-+}
+     const result = await startCheckout(input, deps.checkoutDeps(), deps.today());
+     return json({ attemptId: result.attemptId, url: result.url, quote: result.quote }, 200, origin, origins);
+   } catch (error) {
 diff --git a/supabase/functions/public-api/index.ts b/supabase/functions/public-api/index.ts
-new file mode 100644
-index 0000000..2203668
---- /dev/null
+index 96bb92a..2203668 100644
+--- a/supabase/functions/public-api/index.ts
 +++ b/supabase/functions/public-api/index.ts
-@@ -0,0 +1,31 @@
-+import { StripeGateway } from '../_shared/integrations/stripe/gateway.ts';
+@@ -1,12 +1,31 @@
+ import { StripeGateway } from '../_shared/integrations/stripe/gateway.ts';
+-import { SupabaseCheckoutRepository } from '../_shared/integrations/supabase/repository.ts';
 +import { SupabaseCheckoutRepository, SupabaseRateLimiter } from '../_shared/integrations/supabase/repository.ts';
 +import { type HumanCheck, TurnstileVerifier } from '../_shared/integrations/turnstile/verify.ts';
-+import { handlePublicApi, montrealToday } from './handler.ts';
-+
-+const allowedOrigins = [Deno.env.get('PUBLIC_SITE_ORIGIN'), Deno.env.get('PUBLIC_PORTAL_ORIGIN')]
-+  .filter((origin): origin is string => Boolean(origin));
-+
+ import { handlePublicApi, montrealToday } from './handler.ts';
+ 
+ const allowedOrigins = [Deno.env.get('PUBLIC_SITE_ORIGIN'), Deno.env.get('PUBLIC_PORTAL_ORIGIN')]
+   .filter((origin): origin is string => Boolean(origin));
+ 
 +/**
 + * Antirobot obligatoire : sans TURNSTILE_SECRET_KEY, /checkout est indisponible,
 + * sauf si CAPTCHA_DISABLED=true (développement local seulement).
@@ -1216,25 +591,22 @@ index 0000000..2203668
 +
 +const check = humanCheck();
 +
-+Deno.serve(request => handlePublicApi(request, {
-+  allowedOrigins,
+ Deno.serve(request => handlePublicApi(request, {
+   allowedOrigins,
 +  humanCheck: check,
-+  today: () => montrealToday(),
+   today: () => montrealToday(),
 +  rateLimiter: () => new SupabaseRateLimiter(),
-+  checkoutDeps: () => ({ billing: new StripeGateway(), repository: new SupabaseCheckoutRepository() }),
-+}));
+   checkoutDeps: () => ({ billing: new StripeGateway(), repository: new SupabaseCheckoutRepository() }),
+ }));
 diff --git a/supabase/functions/stripe-webhook/handler.ts b/supabase/functions/stripe-webhook/handler.ts
-new file mode 100644
-index 0000000..cfb6c21
---- /dev/null
+index f6fad79..cfb6c21 100644
+--- a/supabase/functions/stripe-webhook/handler.ts
 +++ b/supabase/functions/stripe-webhook/handler.ts
-@@ -0,0 +1,61 @@
-+/**
-+ * Webhook Stripe. La signature est vérifiée avant tout. Chaque événement est
-+ * dirigé vers un service; une erreur répond 500 pour que Stripe renvoie
-+ * l'événement plus tard (jusqu'à 3 jours) : c'est ce qui rend les reprises
-+ * automatiques (remboursement refusé, dossier pas encore créé, panne).
-+ */
+@@ -4,10 +4,16 @@
+  * l'événement plus tard (jusqu'à 3 jours) : c'est ce qui rend les reprises
+  * automatiques (remboursement refusé, dossier pas encore créé, panne).
+  */
+-import { checkoutEvent, refundSignal, subscriptionSignal, verifyWebhook } from '../_shared/integrations/stripe/webhook.ts';
 +import {
 +  checkoutEvent,
 +  expiredCheckout,
@@ -1242,96 +614,56 @@ index 0000000..cfb6c21
 +  subscriptionSignal,
 +  verifyWebhook,
 +} from '../_shared/integrations/stripe/webhook.ts';
-+import { completeCheckout } from '../_shared/services/complete-checkout.ts';
-+import type { BillingGateway, CheckoutRepository } from '../_shared/services/ports.ts';
+ import { completeCheckout } from '../_shared/services/complete-checkout.ts';
+ import type { BillingGateway, CheckoutRepository } from '../_shared/services/ports.ts';
+-import { syncRefund, syncSubscription } from '../_shared/services/sync-billing.ts';
 +import { closeExpiredSession, syncRefund, syncSubscription } from '../_shared/services/sync-billing.ts';
-+
-+export interface WebhookDeps {
-+  verify?: typeof verifyWebhook;
-+  services(): { billing: BillingGateway; repository: CheckoutRepository };
-+}
-+
-+const text = (body: string, status: number) =>
-+  new Response(body, { status, headers: { 'content-type': 'text/plain; charset=utf-8' } });
-+
-+export async function handleStripeWebhook(request: Request, deps: WebhookDeps): Promise<Response> {
-+  if (request.method !== 'POST') return text('Méthode non permise', 405);
-+  let event;
-+  try {
-+    event = await (deps.verify ?? verifyWebhook)(await request.text(), request.headers.get('stripe-signature'));
-+  } catch {
-+    return text('Signature Stripe invalide', 400);
-+  }
-+  try {
-+    const checkout = checkoutEvent(event);
-+    if (checkout) {
-+      const outcome = await completeCheckout(checkout.attemptId, event.id, deps.services());
-+      // Un autre traitement tient le verrou : Stripe renverra l'événement.
-+      if (outcome === 'busy') return text('Traitement en cours, réessayer', 503);
-+      // 'pending' : paiement asynchrone, l'événement async_payment_succeeded suivra.
-+      return text(outcome, 200);
-+    }
-+    const subscription = subscriptionSignal(event);
-+    if (subscription) {
-+      await syncSubscription(subscription, deps.services());
-+      return text('ok', 200);
-+    }
-+    const refund = refundSignal(event);
-+    if (refund) {
+ 
+ export interface WebhookDeps {
+   verify?: typeof verifyWebhook;
+@@ -41,9 +47,11 @@ export async function handleStripeWebhook(request: Request, deps: WebhookDeps):
+     }
+     const refund = refundSignal(event);
+     if (refund) {
+-      const known = await syncRefund(refund, deps.services());
+-      return text(known ? 'ok' : 'remboursement inconnu : ignoré', 200);
 +      // 'not_recorded' lève une erreur → 500 : Stripe renverra l'événement.
 +      return text(await syncRefund(refund, deps.services()), 200);
-+    }
+     }
 +    const expired = expiredCheckout(event);
 +    if (expired) return text(await closeExpiredSession(expired.attemptId, deps.services()), 200);
-+    return text('ignoré', 200);
-+  } catch (error) {
-+    console.error('stripe-webhook : échec', event.type, event.id,
-+      error instanceof Error ? `${error.name}: ${error.message}` : String(error));
-+    return text('Échec temporaire', 500);
-+  }
-+}
-diff --git a/supabase/functions/stripe-webhook/index.ts b/supabase/functions/stripe-webhook/index.ts
-new file mode 100644
-index 0000000..1252e1f
---- /dev/null
-+++ b/supabase/functions/stripe-webhook/index.ts
-@@ -0,0 +1,7 @@
-+import { StripeGateway } from '../_shared/integrations/stripe/gateway.ts';
-+import { SupabaseCheckoutRepository } from '../_shared/integrations/supabase/repository.ts';
-+import { handleStripeWebhook } from './handler.ts';
-+
-+Deno.serve(request => handleStripeWebhook(request, {
-+  services: () => ({ billing: new StripeGateway(), repository: new SupabaseCheckoutRepository() }),
-+}));
+     return text('ignoré', 200);
+   } catch (error) {
+     console.error('stripe-webhook : échec', event.type, event.id,
 diff --git a/supabase/functions/tests/api/public_api_test.ts b/supabase/functions/tests/api/public_api_test.ts
-new file mode 100644
-index 0000000..a075af8
---- /dev/null
+index 993efc6..a075af8 100644
+--- a/supabase/functions/tests/api/public_api_test.ts
 +++ b/supabase/functions/tests/api/public_api_test.ts
-@@ -0,0 +1,227 @@
-+import test from 'node:test';
-+import assert from 'node:assert/strict';
+@@ -1,6 +1,7 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { handlePublicApi, montrealToday, type PublicApiDeps } from '../../public-api/handler.ts';
 +import { handlePublicApi, LIMITS, montrealToday, type PublicApiDeps, type RateLimiter } from '../../public-api/handler.ts';
 +import { TurnstileVerifier } from '../../_shared/integrations/turnstile/verify.ts';
-+import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
-+import { torontoMidnight } from '../../_shared/integrations/stripe/time.ts';
-+import type { CheckoutRepository } from '../../_shared/services/ports.ts';
-+import { FakeRepository } from '../services/fake-repository.ts';
-+
-+const SITE = 'https://mavera.test';
-+const body = (extra: Record<string, unknown> = {}) => ({
-+  attemptId: '7fc50a4e-ec4b-47e3-998a-3d5f99e55b91', email: 'Test@Example.ca', phone: '5145550100',
-+  displayName: 'Test Co', planCode: 'depart', billingOption: 'monthly', startMonth: 'current',
-+  booksUpToDate: true, usesQuickbooks: false, estimatedTransactions: 14,
+ import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
+ import { torontoMidnight } from '../../_shared/integrations/stripe/time.ts';
+ import type { CheckoutRepository } from '../../_shared/services/ports.ts';
+@@ -11,22 +12,33 @@ const body = (extra: Record<string, unknown> = {}) => ({
+   attemptId: '7fc50a4e-ec4b-47e3-998a-3d5f99e55b91', email: 'Test@Example.ca', phone: '5145550100',
+   displayName: 'Test Co', planCode: 'depart', billingOption: 'monthly', startMonth: 'current',
+   booksUpToDate: true, usesQuickbooks: false, estimatedTransactions: 14,
+-  successUrl: `${SITE}/merci`, cancelUrl: `${SITE}/forfaits`, ...extra,
 +  successUrl: `${SITE}/merci`, cancelUrl: `${SITE}/forfaits`, captchaToken: 'jeton-humain', ...extra,
-+});
+ });
+-const post = (route: string, payload: unknown, origin = SITE) =>
 +const post = (route: string, payload: unknown, origin: string | null = SITE, ip = '203.0.113.7') =>
-+  new Request(`http://localhost/functions/v1/public-api/${route}`, {
+   new Request(`http://localhost/functions/v1/public-api/${route}`, {
+-    method: 'POST', headers: { origin, 'content-type': 'application/json' },
 +    method: 'POST',
 +    headers: { ...(origin ? { origin } : {}), 'content-type': 'application/json', 'x-forwarded-for': `${ip}, 10.0.0.1` },
-+    body: typeof payload === 'string' ? payload : JSON.stringify(payload),
-+  });
-+
+     body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+   });
+ 
 +/** Même règle que rate_limit_hit, en mémoire. */
 +class MemoryLimiter implements RateLimiter {
 +  hits = new Map<string, number>();
@@ -1340,142 +672,38 @@ index 0000000..a075af8
 +    return Promise.resolve(n <= limit);
 +  }
 +}
-+function setup(today = '2026-10-20') {
+ function setup(today = '2026-10-20') {
+-  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
 +  const repo = new FakeRepository(); const stripe = new FakeStripeGateway(); const limiter = new MemoryLimiter();
-+  let built = 0;
-+  const deps: PublicApiDeps = {
-+    allowedOrigins: [SITE], today: () => today,
+   let built = 0;
+   const deps: PublicApiDeps = {
+     allowedOrigins: [SITE], today: () => today,
 +    humanCheck: { verify: (token: string) => Promise.resolve(token === 'jeton-humain') },
 +    rateLimiter: () => limiter,
-+    checkoutDeps: () => { built++; return { billing: stripe, repository: repo }; },
-+  };
+     checkoutDeps: () => { built++; return { billing: stripe, repository: repo }; },
+   };
+-  return { repo, stripe, deps, built: () => built };
 +  return { repo, stripe, deps, limiter, built: () => built };
-+}
-+async function error(res: Response) {
-+  return (await res.json() as { error: { code: string; message: string; details?: string[] } }).error;
-+}
-+
-+test('checkout : adresse de paiement Stripe et récapitulatif, en-tête CORS du site', async () => {
-+  const { deps, stripe } = setup();
-+  const res = await handlePublicApi(post('checkout', body()), deps);
-+  assert.equal(res.status, 200);
-+  assert.equal(res.headers.get('access-control-allow-origin'), SITE);
-+  const data = await res.json();
-+  assert.match(data.url, /^https:\/\/checkout\.stripe\.test\//);
-+  assert.equal(data.quote.dueToday.totalCents, 17800);
-+  assert.equal(stripe.checkoutCreates, 1);
-+});
-+
-+test('quote : récapitulatif sans Stripe ni base de données', async () => {
-+  const { deps, built } = setup();
-+  const res = await handlePublicApi(post('quote', { planCode: 'elan', billingOption: 'annual',
-+    startMonth: 'next', estimatedTransactions: 40 }), deps);
-+  assert.equal(res.status, 200);
-+  assert.equal((await res.json()).quote.terms.planCode, 'elan');
-+  assert.equal(built(), 0);
-+});
-+
-+test('demandes mal formées : 400 invalid_request, jamais une panne', async () => {
-+  const { deps, stripe } = setup();
-+  for (const payload of [
-+    '{pas du json', [], body({ email: 'pas-un-courriel' }), body({ booksUpToDate: 'oui' }),
-+    body({ estimatedTransactions: -1 }), body({ billingOption: 'weekly' }), body({ attemptId: 'abc' }),
-+    body({ planCode: 'inconnu' }), body({ planCode: 'trajet' }),
-+  ]) {
-+    const res = await handlePublicApi(post('checkout', payload), deps);
-+    assert.equal(res.status, 400, JSON.stringify(payload));
-+    assert.equal((await error(res)).code, 'invalid_request');
-+  }
-+  assert.equal(stripe.checkoutCreates, 0);
-+});
-+
-+test('adresse de retour vers un autre site : refusée', async () => {
-+  const { deps } = setup();
-+  const res = await handlePublicApi(post('checkout', body({ successUrl: 'https://pirate.test/merci' })), deps);
-+  assert.equal(res.status, 400);
-+});
-+
-+test('origine inconnue, mauvaise méthode, route inconnue, corps trop gros', async () => {
-+  const { deps } = setup();
-+  assert.equal((await handlePublicApi(post('checkout', body(), 'https://pirate.test'), deps)).status, 403);
-+  assert.equal((await handlePublicApi(new Request('http://localhost/public-api/checkout'), deps)).status, 405);
-+  assert.equal((await handlePublicApi(post('admin', body()), deps)).status, 404);
-+  assert.equal((await handlePublicApi(post('checkout', body({ displayName: 'x'.repeat(20_000) })), deps)).status, 413);
-+  const preflight = await handlePublicApi(new Request('http://localhost/public-api/checkout',
-+    { method: 'OPTIONS', headers: { origin: SITE } }), deps);
-+  assert.equal(preflight.status, 204);
-+  assert.equal(preflight.headers.get('access-control-allow-origin'), SITE);
-+});
-+
-+test('Trajet non admissible : 422 avec les critères non remplis', async () => {
-+  const { deps } = setup();
-+  const res = await handlePublicApi(post('checkout', body({ planCode: 'trajet', estimatedTransactions: 14,
-+    trajetProfile: { platformIncomeOnly: false, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 14 } })), deps);
-+  assert.equal(res.status, 422);
-+  const e = await error(res);
-+  assert.equal(e.code, 'trajet_not_eligible');
-+  assert.ok(e.details && e.details.length > 0);
-+});
-+
+ }
+ async function error(res: Response) {
+   return (await res.json() as { error: { code: string; message: string; details?: string[] } }).error;
+@@ -94,9 +106,10 @@ test('Trajet non admissible : 422 avec les critères non remplis', async () => {
+   assert.ok(e.details && e.details.length > 0);
+ });
+ 
+-test('refus d\'inscription : code et message pour le site', async () => {
 +test('ancien client ou refus : même réponse, le site ne révèle pas qui est client', async () => {
-+  for (const [eligibility, code, status] of [
+   for (const [eligibility, code, status] of [
+-    ['returning', 'returning_client', 409], ['active', 'not_allowed', 409], ['refused', 'not_allowed', 409],
 +    ['returning', 'cannot_signup_online', 409], ['active', 'cannot_signup_online', 409],
 +    ['refused', 'cannot_signup_online', 409],
-+  ] as const) {
-+    const { deps, repo } = setup(); repo.eligibility = eligibility;
-+    const res = await handlePublicApi(post('checkout', body()), deps);
-+    assert.equal(res.status, status);
-+    const e = await error(res);
-+    assert.equal(e.code, code);
-+    assert.ok(e.message.length > 20);
-+  }
-+});
-+
-+test('paiement déjà en cours pour ce courriel : 409 payment_in_progress', async () => {
-+  const { deps, repo } = setup();
-+  await handlePublicApi(post('checkout', body()), deps);
-+  repo.attempts.get(body().attemptId as string)!.paidAt = new Date().toISOString();
-+  const res = await handlePublicApi(post('checkout', body({ attemptId: '0b6d9f0e-3c1a-4f7e-9a51-6c2d8e4f1a20' })), deps);
-+  assert.equal(res.status, 409);
-+  assert.equal((await error(res)).code, 'payment_in_progress');
-+});
-+
-+test('page de paiement expirée : 410, le site recommence avec un nouvel identifiant', async () => {
-+  const { deps, stripe } = setup();
-+  const first = await (await handlePublicApi(post('checkout', body()), deps)).json();
-+  stripe.sessionStatus.set(new URL(first.url).pathname.slice(1), 'expired');
-+  const res = await handlePublicApi(post('checkout', body()), deps);
-+  assert.equal(res.status, 410);
-+  assert.equal((await error(res)).code, 'attempt_expired');
-+});
-+
-+test('dernière demi-heure du mois : 409 checkout_window_closed', async () => {
-+  const { deps, stripe } = setup('2026-10-31');
-+  stripe.nowSeconds = torontoMidnight('2026-11-01') - 20 * 60;
-+  const res = await handlePublicApi(post('checkout', body()), deps);
-+  assert.equal(res.status, 409);
-+  assert.equal((await error(res)).code, 'checkout_window_closed');
-+});
-+
-+test('panne (base ou Stripe) : 503 sans détail technique', async () => {
-+  const { deps, repo } = setup();
-+  const broken: CheckoutRepository = Object.assign(Object.create(repo), {
-+    checkEligibility: () => Promise.reject(new Error('connexion refusée : 10.0.0.5:5432')),
-+  });
-+  const original = console.error; console.error = () => {};
-+  try {
-+    const res = await handlePublicApi(post('checkout', body()),
-+      { ...deps, checkoutDeps: () => ({ billing: new FakeStripeGateway(), repository: broken }) });
-+    assert.equal(res.status, 503);
-+    const e = await error(res);
-+    assert.equal(e.code, 'unavailable');
-+    assert.ok(!e.message.includes('10.0.0.5'));
-+  } finally { console.error = original; }
-+});
-+
-+test('jour courant calculé à Montréal, pas en UTC', () => {
-+  assert.equal(montrealToday(new Date('2026-11-01T02:30:00Z')), '2026-10-31');
-+});
+   ] as const) {
+     const { deps, repo } = setup(); repo.eligibility = eligibility;
+     const res = await handlePublicApi(post('checkout', body()), deps);
+@@ -152,3 +165,63 @@ test('panne (base ou Stripe) : 503 sans détail technique', async () => {
+ test('jour courant calculé à Montréal, pas en UTC', () => {
+   assert.equal(montrealToday(new Date('2026-11-01T02:30:00Z')), '2026-10-31');
+ });
 +
 +test('/checkout sans en-tête Origin : refusé (appel hors navigateur)', async () => {
 +  const { deps, stripe } = setup();
@@ -1537,92 +765,18 @@ index 0000000..a075af8
 +  assert.equal(await new TurnstileVerifier('s', [], reply({ success: true })).verify('', null), false);
 +});
 diff --git a/supabase/functions/tests/api/stripe_webhook_test.ts b/supabase/functions/tests/api/stripe_webhook_test.ts
-new file mode 100644
-index 0000000..4e44423
---- /dev/null
+index 741eee8..4e44423 100644
+--- a/supabase/functions/tests/api/stripe_webhook_test.ts
 +++ b/supabase/functions/tests/api/stripe_webhook_test.ts
-@@ -0,0 +1,103 @@
-+import test from 'node:test';
-+import assert from 'node:assert/strict';
-+import { handleStripeWebhook } from '../../stripe-webhook/handler.ts';
-+import { Stripe } from '../../_shared/integrations/stripe/client.ts';
-+import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
-+import { startCheckout } from '../../_shared/services/start-checkout.ts';
-+import type { SignupInput } from '../../_shared/services/ports.ts';
-+import { FakeRepository } from '../services/fake-repository.ts';
-+
-+const secret = 'whsec_local_test_signature_only';
-+Deno.env.set('STRIPE_WEBHOOK_SECRET', secret);
-+const ATTEMPT = '7fc50a4e-ec4b-47e3-998a-3d5f99e55b91';
-+const sign = (payload: string) =>
-+  new Stripe('sk_test_unused', { httpClient: Stripe.createFetchHttpClient() })
-+    .webhooks.generateTestHeaderStringAsync({ payload, secret, cryptoProvider: Stripe.createSubtleCryptoProvider() });
-+const event = (id: string, type: string, object: Record<string, unknown>) =>
-+  JSON.stringify({ id, object: 'event', type, created: 1792540000, data: { object } });
-+const deliver = async (payload: string, deps: Parameters<typeof handleStripeWebhook>[1], signature?: string) =>
-+  await handleStripeWebhook(new Request('http://localhost/functions/v1/stripe-webhook', {
-+    method: 'POST', headers: { 'stripe-signature': signature ?? await sign(payload) }, body: payload,
-+  }), deps);
-+const input: SignupInput = {
-+  attemptId: ATTEMPT, email: 'test@example.ca', phone: '5145550100', displayName: 'Test Co',
-+  planCode: 'depart', billingOption: 'monthly', startMonth: 'current', booksUpToDate: true,
-+  usesQuickbooks: false, estimatedTransactions: 14,
-+  successUrl: 'https://mavera.test/merci', cancelUrl: 'https://mavera.test/forfaits',
-+};
-+async function paidSignup() {
-+  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
-+  await startCheckout(input, { repository: repo, billing: stripe }, '2026-10-20');
-+  return { repo, stripe, deps: { services: () => ({ repository: repo, billing: stripe }) } };
-+}
-+const completed = event('evt_1', 'checkout.session.completed',
-+  { id: `cs_test_${ATTEMPT}`, object: 'checkout.session', metadata: { attempt_id: ATTEMPT } });
-+const quiet = async <T>(fn: () => Promise<T>) => {
-+  const original = console.error; console.error = () => {};
-+  try { return await fn(); } finally { console.error = original; }
-+};
-+
-+test('signature absente ou falsifiée : 400, aucun traitement', async () => {
-+  const { deps, repo } = await paidSignup();
-+  assert.equal((await deliver(completed, deps, 't=1,v1=faux')).status, 400);
-+  assert.equal(repo.completeCalls, 0);
-+});
-+
-+test('paiement terminé : dossier créé une seule fois, même si Stripe renvoie l\'événement', async () => {
-+  const { deps, repo, stripe } = await paidSignup();
-+  const first = await deliver(completed, deps);
-+  assert.equal(first.status, 200);
-+  assert.equal(await first.text(), 'completed');
-+  assert.equal(await (await deliver(completed, deps)).text(), 'already_completed');
-+  assert.equal(repo.completeCalls, 1);
-+  assert.equal(stripe.subscriptionCreates, 1);
-+});
-+
-+test('traitement déjà en cours : 503 pour que Stripe renvoie plus tard', async () => {
-+  const { deps, repo } = await paidSignup();
-+  repo.token = 'autre-traitement';
-+  assert.equal((await deliver(completed, deps)).status, 503);
-+});
-+
-+test('remboursement refusé par Stripe : 500, l\'événement sera rejoué', async () => {
-+  const { deps, repo, stripe } = await paidSignup();
-+  repo.eligibility = 'refused'; stripe.nextRefundStatus = 'failed';
-+  assert.equal((await quiet(() => deliver(completed, deps))).status, 500);
-+  assert.equal(repo.attempts.get(ATTEMPT)!.rejectedAt, null);
-+  stripe.nextRefundStatus = 'succeeded';
-+  assert.equal(await (await deliver(completed, deps)).text(), 'rejected');
-+});
-+
-+test('facture : statut relu chez Stripe; abonnement inconnu → 500 et reprise', async () => {
-+  const { deps, repo, stripe } = await paidSignup();
-+  stripe.subscriptionStatus.set('sub_1', 'past_due');
-+  const invoice = event('evt_inv', 'invoice.payment_failed', { id: 'in_1', object: 'invoice',
-+    parent: { subscription_details: { subscription: 'sub_1', metadata: { attempt_id: ATTEMPT } } } });
-+  assert.equal((await deliver(invoice, deps)).status, 200);
-+  assert.equal(repo.states[0].status, 'past_due');
-+  repo.applySubscriptionState = () => Promise.reject(new Error('P0001 abonnement pas encore associé'));
-+  assert.equal((await quiet(() => deliver(invoice, deps))).status, 500);
-+});
-+
+@@ -79,11 +79,25 @@ test('facture : statut relu chez Stripe; abonnement inconnu → 500 et reprise',
+   assert.equal((await quiet(() => deliver(invoice, deps))).status, 500);
+ });
+ 
+-test('remboursement suivi, événements étrangers ignorés', async () => {
+-  const { deps } = await paidSignup();
+-  const refund = event('evt_ref', 'refund.failed',
+-    { id: 're_x', object: 'refund', status: 'failed', metadata: { attempt_id: ATTEMPT } });
+-  assert.equal(await (await deliver(refund, deps)).text(), 'remboursement inconnu : ignoré');
 +test('remboursement : relu chez Stripe; pas encore enregistré → 500; inconnu ou étranger → 200', async () => {
 +  const { deps, stripe } = await paidSignup();
 +  const early = await stripe.refund({ attemptId: ATTEMPT, paymentIntentId: 'pi', amountCents: 17800, reason: 'x' });
@@ -1632,9 +786,9 @@ index 0000000..4e44423
 +  const unknown = event('evt_ref2', 'refund.failed',
 +    { id: early.refundId, object: 'refund', status: 'failed', metadata: { attempt_id: '0b6d9f0e-3c1a-4f7e-9a51-6c2d8e4f1a20' } });
 +  assert.equal(await (await deliver(unknown, deps)).text(), 'unknown_attempt');
-+  const other = event('evt_other', 'customer.created', { id: 'cus_1', object: 'customer' });
-+  assert.equal(await (await deliver(other, deps)).text(), 'ignoré');
-+});
+   const other = event('evt_other', 'customer.created', { id: 'cus_1', object: 'customer' });
+   assert.equal(await (await deliver(other, deps)).text(), 'ignoré');
+ });
 +
 +test('session expirée chez Stripe : la tentative non payée est abandonnée', async () => {
 +  const repo = new FakeRepository(); const stripe = new FakeStripeGateway(); stripe.nextPaid = false;
@@ -1678,84 +832,54 @@ index 5882978..8882b01 100644
  
  Deno.test('le SDK Stripe n\'est importé que dans integrations/stripe', async () => {
 diff --git a/supabase/functions/tests/integrations/supabase/repository_test.ts b/supabase/functions/tests/integrations/supabase/repository_test.ts
-new file mode 100644
-index 0000000..754eb54
---- /dev/null
+index 2d1b24b..754eb54 100644
+--- a/supabase/functions/tests/integrations/supabase/repository_test.ts
 +++ b/supabase/functions/tests/integrations/supabase/repository_test.ts
-@@ -0,0 +1,81 @@
-+import test from 'node:test';
-+import assert from 'node:assert/strict';
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { DatabaseError, mapAttempt, type RpcClient, SupabaseCheckoutRepository }
 +import { DatabaseError, mapAttempt, type RpcClient, SupabaseCheckoutRepository, SupabaseRateLimiter }
-+  from '../../../_shared/integrations/supabase/repository.ts';
-+import { SignupError, type SignupInput } from '../../../_shared/services/ports.ts';
-+
-+type Call = { fn: string; params: Record<string, unknown> };
-+function fakeDb(reply: (call: Call) => { data?: unknown; error?: { code: string; message: string } }) {
-+  const calls: Call[] = [];
-+  const db = {
-+    rpc: (fn: string, params: Record<string, unknown>) => {
-+      calls.push({ fn, params });
-+      const r = reply({ fn, params });
-+      return Promise.resolve({ data: r.data ?? null, error: r.error ?? null });
-+    },
-+  } as unknown as RpcClient;
-+  return { db, calls };
-+}
-+const input = { attemptId: 'a', email: 'x@y.ca', phone: '1', displayName: 'X', booksUpToDate: true,
-+  usesQuickbooks: false, estimatedTransactions: 3 } as SignupInput;
-+
-+test('refus de checkout_attempt_create traduits pour le site', async () => {
-+  for (const [sqlstate, code] of [['P0004', 'not_allowed'], ['P0005', 'payment_in_progress'],
-+    ['P0006', 'returning_client']] as const) {
-+    const { db } = fakeDb(() => ({ error: { code: sqlstate, message: 'refus' } }));
+   from '../../../_shared/integrations/supabase/repository.ts';
+ import { SignupError, type SignupInput } from '../../../_shared/services/ports.ts';
+ 
+@@ -23,11 +23,11 @@ test('refus de checkout_attempt_create traduits pour le site', async () => {
+   for (const [sqlstate, code] of [['P0004', 'not_allowed'], ['P0005', 'payment_in_progress'],
+     ['P0006', 'returning_client']] as const) {
+     const { db } = fakeDb(() => ({ error: { code: sqlstate, message: 'refus' } }));
+-    await assert.rejects(new SupabaseCheckoutRepository(db).createAttempt(input, {} as never),
 +    await assert.rejects(new SupabaseCheckoutRepository(db).createAttempt(input, {} as never, 'f'.repeat(64)),
-+      (e: unknown) => e instanceof SignupError && e.code === code);
-+  }
-+  const { db } = fakeDb(() => ({ error: { code: '22023', message: 'récapitulatif incohérent' } }));
+       (e: unknown) => e instanceof SignupError && e.code === code);
+   }
+   const { db } = fakeDb(() => ({ error: { code: '22023', message: 'récapitulatif incohérent' } }));
+-  await assert.rejects(new SupabaseCheckoutRepository(db).createAttempt(input, {} as never),
 +  await assert.rejects(new SupabaseCheckoutRepository(db).createAttempt(input, {} as never, 'f'.repeat(64)),
-+    (e: unknown) => e instanceof DatabaseError && e.code === '22023');
-+});
-+
-+test('les codes SQL de la finalisation restent lisibles par complete-checkout (P0003, P0004)', async () => {
-+  const { db } = fakeDb(() => ({ error: { code: 'P0004', message: 'mandat déjà ouvert' } }));
-+  await assert.rejects(new SupabaseCheckoutRepository(db).complete('a', 't', 'evt', '2026-10-27T00:00:00Z'),
-+    (e: unknown) => e instanceof DatabaseError && e.code === 'P0004');
-+});
-+
-+test('paramètres envoyés aux fonctions SQL : noms exacts de la migration 0900', async () => {
-+  const { db, calls } = fakeDb(() => ({ data: true }));
-+  const repo = new SupabaseCheckoutRepository(db);
-+  await repo.savePayment('a', 't', { sessionId: 's', attemptId: 'a', customerId: 'c', paymentIntentId: 'pi',
-+    paymentMethodId: 'pm', amountPaidCents: 17800, currency: 'cad', paid: true, paidAt: '2026-10-20T12:00:00Z' });
-+  await repo.reject('a', 't', { refundId: 're', status: 'pending', amountCents: 17800 }, 'motif');
-+  await repo.applySubscriptionState({ eventId: 'e', type: 'invoice.paid', subscriptionId: 'sub',
-+    status: 'active', readAt: '2026-10-20T12:00:00Z' });
+     (e: unknown) => e instanceof DatabaseError && e.code === '22023');
+ });
+ 
+@@ -45,12 +45,16 @@ test('paramètres envoyés aux fonctions SQL : noms exacts de la migration 0900'
+   await repo.reject('a', 't', { refundId: 're', status: 'pending', amountCents: 17800 }, 'motif');
+   await repo.applySubscriptionState({ eventId: 'e', type: 'invoice.paid', subscriptionId: 'sub',
+     status: 'active', readAt: '2026-10-20T12:00:00Z' });
+-  await repo.updateRefundStatus({ refundId: 're', status: 'succeeded' });
 +  await repo.updateRefundStatus({ attemptId: 'a', refundId: 're', status: 'succeeded' });
 +  await repo.createAttempt(input, {} as never, 'f'.repeat(64)).catch(() => {});
-+  assert.deepEqual(calls.map(c => [c.fn, Object.keys(c.params).sort()]), [
-+    ['checkout_attempt_paid', ['p_amount_cents', 'p_customer_id', 'p_id', 'p_intent_id', 'p_method_id', 'p_session_id', 'p_token']],
-+    ['checkout_attempt_reject', ['p_id', 'p_reason', 'p_refund_amount_cents', 'p_refund_id', 'p_refund_status', 'p_token']],
-+    ['apply_stripe_subscription_state', ['p_event_id', 'p_read_at', 'p_status', 'p_subscription_id', 'p_type']],
+   assert.deepEqual(calls.map(c => [c.fn, Object.keys(c.params).sort()]), [
+     ['checkout_attempt_paid', ['p_amount_cents', 'p_customer_id', 'p_id', 'p_intent_id', 'p_method_id', 'p_session_id', 'p_token']],
+     ['checkout_attempt_reject', ['p_id', 'p_reason', 'p_refund_amount_cents', 'p_refund_id', 'p_refund_status', 'p_token']],
+     ['apply_stripe_subscription_state', ['p_event_id', 'p_read_at', 'p_status', 'p_subscription_id', 'p_type']],
+-    ['checkout_attempt_refund_status', ['p_refund_id', 'p_status']],
 +    ['checkout_attempt_refund_status', ['p_attempt_id', 'p_refund_id', 'p_status']],
 +    ['checkout_attempt_create', ['p_books_up_to_date', 'p_display_name', 'p_email', 'p_estimated_transactions', 'p_id',
 +      'p_phone', 'p_quote', 'p_request_fingerprint', 'p_uses_quickbooks']],
 +    ['checkout_attempt_get', ['p_id']],
-+  ]);
-+});
-+
-+test('lecture d\'une tentative : colonnes SQL → CheckoutAttempt', async () => {
-+  const row = { id: 'a', created_at: '2026-10-20T12:00:00Z', email: 'x@y.ca', phone: '1', display_name: 'X',
-+    books_up_to_date: true, uses_quickbooks: false, estimated_transactions: 3, granted_quote: { startsOn: '2026-10-01' },
-+    stripe_session_id: 'cs', paid_amount_cents: 17800, paid_at: '2026-10-20T12:01:00Z', abandoned_at: null };
-+  const { db } = fakeDb(c => ({ data: c.fn === 'checkout_attempt_get' ? [row] : null }));
-+  const a = await new SupabaseCheckoutRepository(db).getAttempt('a');
-+  assert.equal(a?.paidAmountCents, 17800);
-+  assert.equal(a?.abandonedAt, null);
-+  assert.equal(a?.stripeSubscriptionId, null);
-+  assert.equal(mapAttempt({ ...row, paid_amount_cents: null }).paidAmountCents, null);
-+  const empty = fakeDb(() => ({ data: [] }));
-+  assert.equal(await new SupabaseCheckoutRepository(empty.db).getAttempt('b'), null);
-+});
+   ]);
+ });
+ 
+@@ -67,3 +71,11 @@ test('lecture d\'une tentative : colonnes SQL → CheckoutAttempt', async () =>
+   const empty = fakeDb(() => ({ data: [] }));
+   assert.equal(await new SupabaseCheckoutRepository(empty.db).getAttempt('b'), null);
+ });
 +
 +test('limite d\'appels : réponse de rate_limit_hit, erreur SQL remontée', async () => {
 +  const ok = fakeDb(() => ({ data: false }));
@@ -1764,36 +888,11 @@ index 0000000..754eb54
 +  const ko = fakeDb(() => ({ error: { code: '08006', message: 'connexion perdue' } }));
 +  await assert.rejects(new SupabaseRateLimiter(ko.db).allow('k', 1, 60), DatabaseError);
 +});
-diff --git a/supabase/functions/tests/scripts/stripe_setup_test.ts b/supabase/functions/tests/scripts/stripe_setup_test.ts
-new file mode 100644
-index 0000000..4a72d56
---- /dev/null
-+++ b/supabase/functions/tests/scripts/stripe_setup_test.ts
-@@ -0,0 +1,12 @@
-+import { assertEquals } from '../domain/pricing/assert.ts';
-+import { expectedRecurringPrices } from '../../../../scripts/stripe-sandbox-setup.ts';
-+
-+Deno.test('bac à sable : 7 prix d\'abonnement, tirés de la grille', () => {
-+  const prices = expectedRecurringPrices().map(p => `${p.lookupKey}=${p.amountCents}/${p.interval}`).sort();
-+  assertEquals(prices, [
-+    'depart_annual_2026_10=79000/year', 'depart_monthly_2026_10=7900/month',
-+    'elan_annual_2026_10=149000/year', 'elan_monthly_2026_10=14900/month',
-+    'envol_annual_2026_10=249000/year', 'envol_monthly_2026_10=24900/month',
-+    'trajet_monthly_2026_10=4900/month',
-+  ]);
-+});
 diff --git a/supabase/functions/tests/services/checkout_test.ts b/supabase/functions/tests/services/checkout_test.ts
-index bc8b7b9..c031b53 100644
+index 660b125..c031b53 100644
 --- a/supabase/functions/tests/services/checkout_test.ts
 +++ b/supabase/functions/tests/services/checkout_test.ts
-@@ -1,12 +1,11 @@
--// deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
- import test from 'node:test';
- import assert from 'node:assert/strict';
--import type { CheckoutAttempt, CheckoutQuote, Eligibility, PaymentProof, SignupInput, RefundResult,
--  RefundSignal, StripeSubscriptionRecord, SubscriptionState, CheckoutRepository } from '../../_shared/services/ports.ts';
-+import type { SignupInput } from '../../_shared/services/ports.ts';
-+import { FakeRepository } from './fake-repository.ts';
+@@ -5,7 +5,7 @@ import { FakeRepository } from './fake-repository.ts';
  import { SignupError } from '../../_shared/services/ports.ts';
  import { startCheckout, prepareQuote } from '../../_shared/services/start-checkout.ts';
  import { completeCheckout } from '../../_shared/services/complete-checkout.ts';
@@ -1802,80 +901,7 @@ index bc8b7b9..c031b53 100644
  import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
  import { torontoMidnight } from '../../_shared/integrations/stripe/time.ts';
  
-@@ -18,72 +17,6 @@ const input = (extra: Partial<SignupInput> = {}): SignupInput => ({
- });
- const SECOND = '0b6d9f0e-3c1a-4f7e-9a51-6c2d8e4f1a20';
- 
--/** Mêmes règles que les fonctions SQL, en mémoire. */
--class FakeRepository implements CheckoutRepository {
--  attempts = new Map<string, CheckoutAttempt>();
--  eligibility: Eligibility = 'new';
--  token: string | null = null;
--  completeCalls = 0;
--  failOnce = false;
--  reasons = new Map<string, string>();
--  refundStatus = new Map<string, string>();
--  states: SubscriptionState[] = [];
--  checkEligibility(): Promise<Eligibility> { return Promise.resolve(this.eligibility); }
--  async createAttempt(i: SignupInput, quote: CheckoutQuote) {
--    if (await this.openAttemptFor(i.email)) throw new Error('P0005 tentative ouverte');
--    const attempt: CheckoutAttempt = { id: i.attemptId, createdAt: new Date().toISOString(),
--      email: i.email, phone: i.phone, displayName: i.displayName,
--      booksUpToDate: i.booksUpToDate, usesQuickbooks: i.usesQuickbooks,
--      estimatedTransactions: i.estimatedTransactions, quote,
--      stripeSessionId: null, stripeCustomerId: null, stripePaymentIntentId: null,
--      stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null, paidAmountCents: null,
--      paidAt: null, completedAt: null, rejectedAt: null, abandonedAt: null, refundId: null };
--    this.attempts.set(i.attemptId, attempt); return attempt;
--  }
--  getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
--  openAttemptFor(email: string) {
--    const open = [...this.attempts.values()].find(a => a.email === email &&
--      !a.completedAt && !a.rejectedAt && !a.abandonedAt);
--    return Promise.resolve(open?.id ?? null);
--  }
--  async abandon(id: string) {
--    const a = this.attempts.get(id)!;
--    if (a.paidAt || this.token) throw new Error('P0001 tentative payée ou verrouillée');
--    a.abandonedAt = new Date().toISOString();
--  }
--  async saveSession(id: string, sessionId: string) { this.attempts.get(id)!.stripeSessionId = sessionId; }
--  async claim(_id: string, token: string) { if (this.token) return false; this.token = token; return true; }
--  async savePayment(id: string, _token: string, proof: PaymentProof) {
--    const a = this.attempts.get(id)!;
--    a.stripeCustomerId = proof.customerId; a.stripePaymentIntentId = proof.paymentIntentId;
--    a.paidAt = proof.paidAt; a.paidAmountCents = proof.amountPaidCents;
--  }
--  async saveSubscription(id: string, _token: string, s: StripeSubscriptionRecord) {
--    const a = this.attempts.get(id)!;
--    a.stripeSubscriptionId = s.subscriptionId; a.stripePriceId = s.priceId; a.stripeStatus = s.status;
--  }
--  async complete(id: string) {
--    this.completeCalls++;
--    if (this.failOnce) { this.failOnce = false; throw new Error('temporary SQL failure'); }
--    this.attempts.get(id)!.completedAt = new Date().toISOString();
--    return 'client_id';
--  }
--  async reject(id: string, _token: string, refund: RefundResult, reason: string) {
--    const a = this.attempts.get(id)!;
--    // Mêmes exigences que checkout_attempt_reject.
--    if (!['pending', 'succeeded'].includes(refund.status) || refund.amountCents !== a.paidAmountCents) {
--      throw new Error('22023 remboursement non conforme');
--    }
--    a.rejectedAt = new Date().toISOString(); a.refundId = refund.refundId;
--    this.reasons.set(id, reason); this.refundStatus.set(refund.refundId, refund.status);
--  }
--  async release() { this.token = null; }
--  async applySubscriptionState(state: SubscriptionState) { this.states.push(state); return true; }
--  async updateRefundStatus(signal: RefundSignal) {
--    if (!this.refundStatus.has(signal.refundId)) return false;
--    this.refundStatus.set(signal.refundId, signal.status); return true;
--  }
--}
- const deps = (repo: FakeRepository, stripe: FakeStripeGateway) => ({ repository: repo, billing: stripe });
- const signupError = (code: string) => (error: unknown) => error instanceof SignupError && error.code === code;
- 
-@@ -272,13 +205,57 @@ test('abonnement : le statut appliqué est celui relu chez Stripe, avec l\'heure
+@@ -205,13 +205,57 @@ test('abonnement : le statut appliqué est celui relu chez Stripe, avec l\'heure
    assert.equal(repo.states[0].eventId, 'evt_old');
  });
  
@@ -1937,77 +963,43 @@ index bc8b7b9..c031b53 100644
 +  assert.equal(await closeExpiredSession(SECOND, { repository: repo2 }), 'unknown_attempt');
  });
 diff --git a/supabase/functions/tests/services/fake-repository.ts b/supabase/functions/tests/services/fake-repository.ts
-new file mode 100644
-index 0000000..308f158
---- /dev/null
+index e2a7973..308f158 100644
+--- a/supabase/functions/tests/services/fake-repository.ts
 +++ b/supabase/functions/tests/services/fake-repository.ts
-@@ -0,0 +1,80 @@
-+// deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
-+/** Faux dépôt pour les tests de services et d'API : uniquement pour les tests. */
-+import type { CheckoutAttempt, CheckoutQuote, CheckoutRepository, Eligibility, PaymentProof, RefundResult,
+@@ -1,7 +1,7 @@
+ // deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
+ /** Faux dépôt pour les tests de services et d'API : uniquement pour les tests. */
+ import type { CheckoutAttempt, CheckoutQuote, CheckoutRepository, Eligibility, PaymentProof, RefundResult,
+-  RefundSignal, SignupInput, StripeSubscriptionRecord, SubscriptionState } from '../../_shared/services/ports.ts';
 +  RefundState, RefundSync, SignupInput, StripeSubscriptionRecord, SubscriptionState } from '../../_shared/services/ports.ts';
-+
-+/** Mêmes règles que les fonctions SQL, en mémoire. */
-+export class FakeRepository implements CheckoutRepository {
-+  attempts = new Map<string, CheckoutAttempt>();
-+  eligibility: Eligibility = 'new';
-+  token: string | null = null;
-+  completeCalls = 0;
-+  failOnce = false;
-+  reasons = new Map<string, string>();
-+  refundStatus = new Map<string, string>();
-+  states: SubscriptionState[] = [];
-+  checkEligibility(): Promise<Eligibility> { return Promise.resolve(this.eligibility); }
+ 
+ /** Mêmes règles que les fonctions SQL, en mémoire. */
+ export class FakeRepository implements CheckoutRepository {
+@@ -14,7 +14,7 @@ export class FakeRepository implements CheckoutRepository {
+   refundStatus = new Map<string, string>();
+   states: SubscriptionState[] = [];
+   checkEligibility(): Promise<Eligibility> { return Promise.resolve(this.eligibility); }
+-  async createAttempt(i: SignupInput, quote: CheckoutQuote) {
 +  async createAttempt(i: SignupInput, quote: CheckoutQuote, requestFingerprint: string) {
-+    if (await this.openAttemptFor(i.email)) throw new Error('P0005 tentative ouverte');
-+    const attempt: CheckoutAttempt = { id: i.attemptId, createdAt: new Date().toISOString(),
-+      email: i.email, phone: i.phone, displayName: i.displayName,
-+      booksUpToDate: i.booksUpToDate, usesQuickbooks: i.usesQuickbooks,
-+      estimatedTransactions: i.estimatedTransactions, quote,
-+      stripeSessionId: null, stripeCustomerId: null, stripePaymentIntentId: null,
-+      stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null, paidAmountCents: null,
+     if (await this.openAttemptFor(i.email)) throw new Error('P0005 tentative ouverte');
+     const attempt: CheckoutAttempt = { id: i.attemptId, createdAt: new Date().toISOString(),
+       email: i.email, phone: i.phone, displayName: i.displayName,
+@@ -22,7 +22,7 @@ export class FakeRepository implements CheckoutRepository {
+       estimatedTransactions: i.estimatedTransactions, quote,
+       stripeSessionId: null, stripeCustomerId: null, stripePaymentIntentId: null,
+       stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null, paidAmountCents: null,
+-      paidAt: null, completedAt: null, rejectedAt: null, abandonedAt: null, refundId: null };
 +      paidAt: null, completedAt: null, rejectedAt: null, abandonedAt: null, refundId: null, requestFingerprint };
-+    this.attempts.set(i.attemptId, attempt); return attempt;
-+  }
-+  getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
-+  openAttemptFor(email: string) {
-+    const open = [...this.attempts.values()].find(a => a.email === email &&
-+      !a.completedAt && !a.rejectedAt && !a.abandonedAt);
-+    return Promise.resolve(open?.id ?? null);
-+  }
-+  async abandon(id: string) {
-+    const a = this.attempts.get(id)!;
-+    if (a.paidAt || this.token) throw new Error('P0001 tentative payée ou verrouillée');
-+    a.abandonedAt = new Date().toISOString();
-+  }
-+  async saveSession(id: string, sessionId: string) { this.attempts.get(id)!.stripeSessionId = sessionId; }
-+  async claim(_id: string, token: string) { if (this.token) return false; this.token = token; return true; }
-+  async savePayment(id: string, _token: string, proof: PaymentProof) {
-+    const a = this.attempts.get(id)!;
-+    a.stripeCustomerId = proof.customerId; a.stripePaymentIntentId = proof.paymentIntentId;
-+    a.paidAt = proof.paidAt; a.paidAmountCents = proof.amountPaidCents;
-+  }
-+  async saveSubscription(id: string, _token: string, s: StripeSubscriptionRecord) {
-+    const a = this.attempts.get(id)!;
-+    a.stripeSubscriptionId = s.subscriptionId; a.stripePriceId = s.priceId; a.stripeStatus = s.status;
-+  }
-+  async complete(id: string) {
-+    this.completeCalls++;
-+    if (this.failOnce) { this.failOnce = false; throw new Error('temporary SQL failure'); }
-+    this.attempts.get(id)!.completedAt = new Date().toISOString();
-+    return 'client_id';
-+  }
-+  async reject(id: string, _token: string, refund: RefundResult, reason: string) {
-+    const a = this.attempts.get(id)!;
-+    // Mêmes exigences que checkout_attempt_reject.
-+    if (!['pending', 'succeeded'].includes(refund.status) || refund.amountCents !== a.paidAmountCents) {
-+      throw new Error('22023 remboursement non conforme');
-+    }
-+    a.rejectedAt = new Date().toISOString(); a.refundId = refund.refundId;
-+    this.reasons.set(id, reason); this.refundStatus.set(refund.refundId, refund.status);
-+  }
-+  async release() { this.token = null; }
-+  async applySubscriptionState(state: SubscriptionState) { this.states.push(state); return true; }
+     this.attempts.set(i.attemptId, attempt); return attempt;
+   }
+   getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
+@@ -64,8 +64,17 @@ export class FakeRepository implements CheckoutRepository {
+   }
+   async release() { this.token = null; }
+   async applySubscriptionState(state: SubscriptionState) { this.states.push(state); return true; }
+-  async updateRefundStatus(signal: RefundSignal) {
+-    if (!this.refundStatus.has(signal.refundId)) return false;
+-    this.refundStatus.set(signal.refundId, signal.status); return true;
 +  /** Mêmes règles que checkout_attempt_refund_status. */
 +  async updateRefundStatus(state: RefundState): Promise<RefundSync> {
 +    const a = this.attempts.get(state.attemptId);
@@ -2020,25 +1012,8 @@ index 0000000..308f158
 +    }
 +    if (!a.rejectedAt && ['pending', 'succeeded', 'requires_action'].includes(state.status)) return 'not_recorded';
 +    return 'ignored';
-+  }
-+}
-diff --git a/supabase/migrations/20261020001000_checkout_attempt_get.sql b/supabase/migrations/20261020001000_checkout_attempt_get.sql
-new file mode 100644
-index 0000000..db3e4b5
---- /dev/null
-+++ b/supabase/migrations/20261020001000_checkout_attempt_get.sql
-@@ -0,0 +1,11 @@
-+-- Lecture d'une tentative par les Edge Functions (service_role seulement).
-+-- Tous les accès des fonctions passent par des fonctions SQL : un seul chemin,
-+-- facile à tester et à restreindre.
-+create function public.checkout_attempt_get(p_id uuid)
-+returns setof public.checkout_attempts
-+language sql stable security definer set search_path = '' as $$
-+  select * from public.checkout_attempts where id = p_id
-+$$;
-+
-+revoke execute on function public.checkout_attempt_get(uuid) from public, anon, authenticated;
-+grant execute on function public.checkout_attempt_get(uuid) to service_role;
+   }
+ }
 diff --git a/supabase/migrations/20261020001100_signup_protection.sql b/supabase/migrations/20261020001100_signup_protection.sql
 new file mode 100644
 index 0000000..225d1b3
@@ -2178,34 +1153,6 @@ index 0000000..225d1b3
 +  public.checkout_attempt_refund_status(uuid, text, text),
 +  public.rate_limit_hit(text, integer, integer)
 +to service_role;
-diff --git a/supabase/tests/rls/checkout_attempt_get.test.sql b/supabase/tests/rls/checkout_attempt_get.test.sql
-new file mode 100644
-index 0000000..0508d87
---- /dev/null
-+++ b/supabase/tests/rls/checkout_attempt_get.test.sql
-@@ -0,0 +1,22 @@
-+-- Lecture d'une tentative par les Edge Functions : service_role seulement.
-+begin;
-+create extension if not exists pgtap with schema extensions;
-+set local search_path = public, extensions;
-+grant execute on all functions in schema extensions to anon, authenticated, service_role;
-+
-+select plan(5);
-+
-+select public.checkout_attempt_create('a1111111-1111-4111-8111-111111111111', 'elise@exemple.ca',
-+  '514 555 0101', 'Élise Conseil', true, false, 40, '{"terms":{"gridVersion":"2026-10","planCode":"elan","billingOption":"monthly_commitment","cycle":"month","recurringPriceCents":14900,"includedTransactions":50,"extraTransactionCents":450,"includedAccounts":3,"extraAccountCents":1500,"includedFilingFrequency":"quarterly","extraFilingCents":2500,"quickbooksIncluded":false,"openingFeeCents":7500,"openingDiscountCents":7400,"stripeRecurringLookupKey":"elan_monthly_2026_10"},"startsOn":"2026-10-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":7500},{"kind":"first_period","amountCents":14900}],"totalCents":22400},"recurring":{"amountCents":14900,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":"2027-10-01","extraTransactionCents":450,"currentMonthBooksUpdate":null,"taxesIncluded":false}'::jsonb);
-+
-+select ok(not has_function_privilege('anon', 'public.checkout_attempt_get(uuid)', 'execute'), 'Visiteur : aucun accès');
-+select ok(not has_function_privilege('authenticated', 'public.checkout_attempt_get(uuid)', 'execute'), 'Client connecté : aucun accès');
-+select ok(has_function_privilege('service_role', 'public.checkout_attempt_get(uuid)', 'execute'), 'Edge Functions : accès');
-+
-+set local role service_role;
-+select is((select email from public.checkout_attempt_get('a1111111-1111-4111-8111-111111111111')), 'elise@exemple.ca', 'Tentative retrouvée');
-+select is((select count(*)::integer from public.checkout_attempt_get('a0000000-0000-4000-8000-000000000000')), 0, 'Tentative inconnue : aucune ligne');
-+reset role;
-+
-+select * from finish();
-+rollback;
 diff --git a/supabase/tests/rls/checkout_attempts.test.sql b/supabase/tests/rls/checkout_attempts.test.sql
 index afb6b38..b6ff435 100644
 --- a/supabase/tests/rls/checkout_attempts.test.sql
