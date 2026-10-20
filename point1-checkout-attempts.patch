@@ -1,0 +1,1602 @@
+diff --git a/supabase/functions/_shared/domain/pricing/terms.ts b/supabase/functions/_shared/domain/pricing/terms.ts
+index 911cb8a..4120272 100644
+--- a/supabase/functions/_shared/domain/pricing/terms.ts
++++ b/supabase/functions/_shared/domain/pricing/terms.ts
+@@ -52,11 +52,12 @@ export interface GrantedTerms {
+   /** Rabais obtenu sur l'ouverture grâce à l'engagement (0 sans engagement). */
+   readonly openingDiscountCents: Cents;
+   /**
+-   * Clés de recherche des prix Stripe (lookup_key). integrations/stripe les
+-   * convertit en identifiants de prix, qui diffèrent entre test et production.
++   * Clé de recherche du prix récurrent Stripe (lookup_key). integrations/stripe
++   * la convertit en identifiant de prix, qui diffère entre test et production.
++   * Les frais d'ouverture n'ont pas de prix Stripe : ils sont facturés au
++   * montant accordé, dans la session de paiement.
+    */
+   readonly stripeRecurringLookupKey: string;
+-  readonly stripeOpeningLookupKey: string;
+ }
+ 
+ export function getPlan(code: PlanCode | string): PlanPricing {
+@@ -124,9 +125,6 @@ export function grantTerms(planCode: PlanCode | string, billing: BillingOption |
+   assertBillingOffered(plan, billing);
+   const option = billing as BillingOption;
+   const cycle = cycleOf(option);
+-  const openingKind = hasCommitment(option) && plan.openingFee.reducedCents !== null
+-    ? "reduced"
+-    : "full";
+   return {
+     gridVersion: GRID_VERSION,
+     planCode: plan.code,
+@@ -143,7 +141,6 @@ export function grantTerms(planCode: PlanCode | string, billing: BillingOption |
+     openingFeeCents: openingFee(plan, option),
+     openingDiscountCents: plan.openingFee.fullCents - openingFee(plan, option),
+     stripeRecurringLookupKey: `${plan.code}_${cycle === "year" ? "annual" : "monthly"}_${lookupKeySuffix()}`,
+-    stripeOpeningLookupKey: `opening_${plan.code}_${openingKind}_${lookupKeySuffix()}`,
+   };
+ }
+ 
+diff --git a/supabase/functions/_shared/integrations/stripe/fake-gateway.ts b/supabase/functions/_shared/integrations/stripe/fake-gateway.ts
+index 3c5dd41..c3b569d 100644
+--- a/supabase/functions/_shared/integrations/stripe/fake-gateway.ts
++++ b/supabase/functions/_shared/integrations/stripe/fake-gateway.ts
+@@ -4,6 +4,9 @@ import {
+   BillingTerminalError,
+   type BillingGateway,
+   type PaymentProof,
++  type RefundResult,
++  type RefundStatus,
++  type SessionExpiry,
+   type StripeSubscriptionRecord,
+ } from '../../services/ports.ts';
+ import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
+@@ -13,7 +16,17 @@ export class FakeStripeGateway implements BillingGateway {
+   subscriptions = new Map<string, StripeSubscriptionRecord & {
+     attemptId: string; customerId: string; anchorOn: string; immediateInvoiceCents: number;
+   }>();
+-  refunds = new Map<string, string>();
++  /** Remboursements par tentative (le dernier accepté ou non). */
++  refunds = new Map<string, RefundResult>();
++  refundCreates = 0;
++  /** Statut des prochains remboursements créés. */
++  nextRefundStatus: RefundStatus = 'succeeded';
++  /** Montant remboursé imposé (simule un remboursement partiel); par défaut le montant demandé. */
++  nextRefundAmountCents: number | null = null;
++  /** État des sessions chez Stripe : une session « complete » ne peut plus être expirée. */
++  sessionStatus = new Map<string, 'open' | 'complete' | 'expired'>();
++  /** Statut d'abonnement relu chez Stripe (getSubscriptionStatus). */
++  subscriptionStatus = new Map<string, string>();
+   canceled = new Set<string>();
+   subscriptionCreates = 0;
+   checkoutCreates = 0;
+@@ -36,19 +49,30 @@ export class FakeStripeGateway implements BillingGateway {
+     if (!this.sessions.has(id)) {
+       this.sessions.set(id, {
+         sessionId: id, attemptId: input.attemptId,
+-        customerId: input.existingCustomerId ?? `cus_${++this.seq}`,
++        customerId: `cus_${++this.seq}`,
+         paymentIntentId: `pi_${input.attemptId}`, paymentMethodId: `pm_${input.attemptId}`,
+         amountPaidCents: input.lines.reduce((sum, line) => sum + line.amountCents, 0),
+         currency: 'cad', paid: this.nextPaid,
+         paidAt: this.nextPaid ? (this.paidAt ?? new Date(this.now() * 1000).toISOString()) : null,
+       });
+     }
++    if (!this.sessionStatus.has(id)) this.sessionStatus.set(id, 'open');
+     return { sessionId: id, url: `https://checkout.stripe.test/${id}` };
+   }
+ 
+   async getCheckoutSession(sessionId: string) {
+     if (!this.sessions.has(sessionId)) throw new Error('Session absente');
+-    return { sessionId, url: `https://checkout.stripe.test/${sessionId}` };
++    const open = this.sessionStatus.get(sessionId) === 'open';
++    return { sessionId, url: open ? `https://checkout.stripe.test/${sessionId}` : null };
++  }
++
++  async expireCheckoutSession(sessionId: string): Promise<SessionExpiry> {
++    const status = this.sessionStatus.get(sessionId);
++    if (!status) throw new Error('Session absente');
++    if (status === 'complete') return 'completed';
++    if (status === 'expired') return 'already_expired';
++    this.sessionStatus.set(sessionId, 'expired');
++    return 'expired';
+   }
+ 
+   async getPaymentProof(sessionId: string) {
+@@ -91,10 +115,22 @@ export class FakeStripeGateway implements BillingGateway {
+ 
+   async refund(input: Parameters<BillingGateway['refund']>[0]) {
+     const existing = this.refunds.get(input.attemptId);
+-    if (existing) return existing;
+-    const id = `re_${input.attemptId}`;
+-    this.refunds.set(input.attemptId, id);
+-    return id;
++    if (existing && existing.status !== 'failed' && existing.status !== 'canceled') return { ...existing };
++    this.refundCreates++;
++    const result: RefundResult = {
++      refundId: `re_${input.attemptId}_${this.refundCreates}`,
++      status: this.nextRefundStatus,
++      amountCents: this.nextRefundAmountCents ?? input.amountCents,
++    };
++    this.refunds.set(input.attemptId, result);
++    return { ...result };
++  }
++
++  async getSubscriptionStatus(subscriptionId: string) {
++    const readAt = new Date(this.now() * 1000).toISOString();
++    const status = this.subscriptionStatus.get(subscriptionId) ?? this.subscriptions.get(subscriptionId)?.status;
++    if (!status) throw new Error('Abonnement absent');
++    return { status, readAt };
+   }
+ 
+   async cancelSubscription(subscriptionId: string) {
+diff --git a/supabase/functions/_shared/integrations/stripe/gateway.ts b/supabase/functions/_shared/integrations/stripe/gateway.ts
+index 0fa9091..06bef00 100644
+--- a/supabase/functions/_shared/integrations/stripe/gateway.ts
++++ b/supabase/functions/_shared/integrations/stripe/gateway.ts
+@@ -3,7 +3,14 @@
+  * et les conditions viennent de domain/pricing, par la tentative enregistrée.
+  * Chaque création chez Stripe a une clé d'idempotence liée à la tentative.
+  */
+-import { BillingTerminalError, type BillingGateway, type PaymentProof } from '../../services/ports.ts';
++import {
++  BillingTerminalError,
++  type BillingGateway,
++  type PaymentProof,
++  type RefundResult,
++  type RefundStatus,
++  type SessionExpiry,
++} from '../../services/ports.ts';
+ import { stripeClient, type Stripe } from './client.ts';
+ import { productIdOf, resolveRecurringPrice } from './prices.ts';
+ import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
+@@ -11,6 +18,10 @@ import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
+ const nowSeconds = (): number => Math.floor(Date.now() / 1000);
+ const idOf = (value: string | { id: string } | null | undefined): string =>
+   typeof value === 'string' ? value : value?.id ?? '';
++const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'failed', 'canceled', 'requires_action']);
++/** Statut inconnu ou absent : traité comme non accepté (jamais comme réussi). */
++const refundStatusOf = (status: string | null): RefundStatus =>
++  status && REFUND_STATUSES.has(status) ? status as RefundStatus : 'requires_action';
+ 
+ export class StripeGateway implements BillingGateway {
+   private stripe = stripeClient();
+@@ -23,9 +34,9 @@ export class StripeGateway implements BillingGateway {
+       currency: 'cad',
+       locale: 'fr-CA',
+       expires_at: expiresAt,
+-      ...(input.existingCustomerId
+-        ? { customer: input.existingCustomerId }
+-        : { customer_creation: 'always' as const, customer_email: input.email }),
++      // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
++      customer_creation: 'always',
++      customer_email: input.email,
+       client_reference_id: input.attemptId,
+       metadata: { attempt_id: input.attemptId },
+       payment_intent_data: {
+@@ -52,6 +63,26 @@ export class StripeGateway implements BillingGateway {
+     return { sessionId: session.id, url: session.status === 'open' ? session.url : null };
+   }
+ 
++  /**
++   * Empêche l'ancienne session d'être payée. Si l'expiration échoue (session
++   * payée entre-temps), l'état réel est relu : une session « complete »
++   * signifie qu'un paiement est en cours de traitement.
++   */
++  async expireCheckoutSession(sessionId: string): Promise<SessionExpiry> {
++    const before = await this.stripe.checkout.sessions.retrieve(sessionId);
++    if (before.status === 'complete') return 'completed';
++    if (before.status === 'expired') return 'already_expired';
++    try {
++      await this.stripe.checkout.sessions.expire(sessionId);
++      return 'expired';
++    } catch (error) {
++      const after = await this.stripe.checkout.sessions.retrieve(sessionId);
++      if (after.status === 'complete') return 'completed';
++      if (after.status === 'expired') return 'already_expired';
++      throw error;
++    }
++  }
++
+   /** Relu chez Stripe à chaque fois : le contenu de l'événement ne suffit pas. */
+   async getPaymentProof(sessionId: string): Promise<PaymentProof> {
+     const session = await this.stripe.checkout.sessions.retrieve(sessionId);
+@@ -145,17 +176,35 @@ export class StripeGateway implements BillingGateway {
+     return { subscriptionId: sub.id, priceId: price.id, status: sub.status };
+   }
+ 
+-  async refund(input: Parameters<BillingGateway['refund']>[0]) {
+-    // Une reprise après 24 h ne doit jamais rembourser deux fois.
++  /**
++   * Rembourse exactement le montant payé. Une reprise réutilise le remboursement
++   * déjà accepté (jamais deux remboursements); après un remboursement échoué ou
++   * annulé, un nouveau est créé avec une nouvelle clé d'idempotence.
++   */
++  async refund(input: Parameters<BillingGateway['refund']>[0]): Promise<RefundResult> {
++    if (!Number.isSafeInteger(input.amountCents) || input.amountCents <= 0) {
++      throw new Error('Montant de remboursement invalide');
++    }
++    let failedBefore = 0;
+     for await (const previous of this.stripe.refunds.list({ payment_intent: input.paymentIntentId, limit: 100 })) {
+-      if (previous.metadata?.attempt_id === input.attemptId && previous.status !== 'failed') return previous.id;
++      if (previous.metadata?.attempt_id !== input.attemptId) continue;
++      const status = refundStatusOf(previous.status);
++      if (status === 'failed' || status === 'canceled') { failedBefore++; continue; }
++      return { refundId: previous.id, status, amountCents: previous.amount };
+     }
+     const refund = await this.stripe.refunds.create({
+       payment_intent: input.paymentIntentId,
+-      ...(input.amountCents === undefined ? {} : { amount: input.amountCents }),
++      amount: input.amountCents,
+       metadata: { attempt_id: input.attemptId, reason: input.reason.slice(0, 300) },
+-    }, { idempotencyKey: `refund:signup:${input.attemptId}` });
+-    return refund.id;
++    }, { idempotencyKey: `refund:signup:${input.attemptId}:${failedBefore}` });
++    return { refundId: refund.id, status: refundStatusOf(refund.status), amountCents: refund.amount };
++  }
++
++  /** L'heure est prise avant la lecture : un état lu plus tôt ne remplace jamais un état plus récent. */
++  async getSubscriptionStatus(subscriptionId: string) {
++    const readAt = new Date().toISOString();
++    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
++    return { status: sub.status, readAt };
+   }
+ 
+   async cancelSubscription(subscriptionId: string, attemptId: string) {
+diff --git a/supabase/functions/_shared/integrations/stripe/webhook.ts b/supabase/functions/_shared/integrations/stripe/webhook.ts
+index cce1aa7..6c0cb8b 100644
+--- a/supabase/functions/_shared/integrations/stripe/webhook.ts
++++ b/supabase/functions/_shared/integrations/stripe/webhook.ts
+@@ -3,7 +3,7 @@
+  * vérifiée avant tout; le contenu de l'événement sert seulement à savoir quoi
+  * relire chez Stripe, jamais de preuve de paiement.
+  */
+-import type { BillingFact } from '../../services/ports.ts';
++import type { RefundSignal, RefundStatus, SubscriptionSignal } from '../../services/ports.ts';
+ import { signatureVerifier, Stripe } from './client.ts';
+ 
+ export async function verifyWebhook(body: string, signature: string | null): Promise<Stripe.Event> {
+@@ -27,8 +27,12 @@ export function checkoutEvent(event: Stripe.Event): { attemptId: string } | null
+   return attemptId ? { attemptId } : null;
+ }
+ 
+-export function billingFact(event: Stripe.Event): BillingFact | null {
+-  const occurredAt = new Date(event.created * 1000).toISOString();
++/**
++ * Événement d'abonnement ou de facture → signal seulement : le statut n'est
++ * jamais lu dans l'événement (ordre d'arrivée non garanti), le service le relit
++ * chez Stripe.
++ */
++export function subscriptionSignal(event: Stripe.Event): SubscriptionSignal | null {
+   if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
+     const invoice = event.data.object as Stripe.Invoice;
+     const details = invoice.parent?.subscription_details;
+@@ -36,13 +40,24 @@ export function billingFact(event: Stripe.Event): BillingFact | null {
+     const subscriptionId = typeof parent === 'string' ? parent : parent?.id;
+     // Facture sans abonnement, ou abonnement qui ne vient pas d'une inscription : ignorée.
+     if (!subscriptionId || !details?.metadata?.attempt_id) return null;
+-    return { eventId: event.id, type: event.type, subscriptionId, occurredAt };
++    return { eventId: event.id, type: event.type, subscriptionId };
+   }
+   if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+     const sub = event.data.object as Stripe.Subscription;
+     // Seuls les abonnements créés par une inscription portent attempt_id.
+     if (!sub.metadata?.attempt_id) return null;
+-    return { eventId: event.id, type: event.type, subscriptionId: sub.id, status: sub.status, occurredAt };
++    return { eventId: event.id, type: event.type, subscriptionId: sub.id };
+   }
+   return null;
+ }
++
++const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'failed', 'canceled', 'requires_action']);
++
++/** Suivi d'un remboursement d'inscription (refund.updated, refund.failed). */
++export function refundSignal(event: Stripe.Event): RefundSignal | null {
++  if (event.type !== 'refund.updated' && event.type !== 'refund.failed') return null;
++  const refund = event.data.object as Stripe.Refund;
++  // Seuls les remboursements d'inscription portent attempt_id.
++  if (!refund.metadata?.attempt_id || !refund.status || !REFUND_STATUSES.has(refund.status)) return null;
++  return { refundId: refund.id, status: refund.status as RefundStatus };
++}
+diff --git a/supabase/functions/_shared/services/complete-checkout.ts b/supabase/functions/_shared/services/complete-checkout.ts
+index 332e193..3f33581 100644
+--- a/supabase/functions/_shared/services/complete-checkout.ts
++++ b/supabase/functions/_shared/services/complete-checkout.ts
+@@ -1,4 +1,4 @@
+-import { BillingTerminalError, type BillingGateway, type CheckoutRepository, type CheckoutAttempt } from './ports.ts';
++import { BillingTerminalError, type BillingGateway, type CheckoutAttempt, type CheckoutRepository } from './ports.ts';
+ 
+ const rejectedCode = (error: unknown): boolean => {
+   if (!error || typeof error !== 'object') return false;
+@@ -8,19 +8,34 @@ const rejectedCode = (error: unknown): boolean => {
+   return ['P0003', 'P0004'].includes(code) || ['P0003', 'P0004'].includes(sqlstate);
+ };
+ 
++/**
++ * Rembourse le montant payé, puis enregistre le refus. Le refus n'est enregistré
++ * que si Stripe a accepté un remboursement complet (réussi ou en cours) : sinon
++ * erreur, le webhook échoue et sera rejoué, et la tentative apparaît « à traiter »
++ * dans l'administration (payée sans dossier).
++ */
+ async function compensate(attempt: CheckoutAttempt, token: string, reason: string,
+   deps: { billing: BillingGateway; repository: CheckoutRepository }): Promise<void> {
+-  if (!attempt.stripePaymentIntentId) throw new Error('Remboursement impossible : PaymentIntent absent');
++  if (!attempt.stripePaymentIntentId || !attempt.paidAmountCents) {
++    throw new Error('Remboursement impossible : paiement non enregistré');
++  }
+   if (attempt.stripeSubscriptionId) {
+     await deps.billing.cancelSubscription(attempt.stripeSubscriptionId, attempt.id);
+   }
+-  const refundId = await deps.billing.refund({
+-    attemptId: attempt.id, paymentIntentId: attempt.stripePaymentIntentId, reason,
++  const refund = await deps.billing.refund({
++    attemptId: attempt.id, paymentIntentId: attempt.stripePaymentIntentId,
++    amountCents: attempt.paidAmountCents, reason,
+   });
+-  await deps.repository.reject(attempt.id, token, refundId, reason);
++  if (refund.status !== 'pending' && refund.status !== 'succeeded') {
++    throw new Error(`Remboursement non accepté par Stripe (${refund.status}) : à traiter`);
++  }
++  if (refund.amountCents !== attempt.paidAmountCents) {
++    throw new Error('Remboursement incomplet : à traiter');
++  }
++  await deps.repository.reject(attempt.id, token, refund, reason);
+ }
+ 
+-/** Seul le webhook appelle cette fonction. La quote n'est jamais recalculée. */
++/** Seul le webhook appelle cette fonction. Le récapitulatif n'est jamais recalculé. */
+ export async function completeCheckout(
+   attemptId: string, eventId: string,
+   deps: { billing: BillingGateway; repository: CheckoutRepository },
+@@ -42,16 +57,26 @@ export async function completeCheckout(
+     if (!proof.customerId || !proof.paymentIntentId || !proof.paymentMethodId || !proof.paidAt) {
+       throw new Error('Moyen de paiement récurrent indisponible');
+     }
+-    if (proof.currency !== 'cad' || proof.amountPaidCents !== a.quote.dueToday.totalCents) {
+-      throw new Error('Paiement reçu non conforme aux conditions accordées');
+-    }
++
++    // Le paiement est toujours enregistré, même non conforme : il doit pouvoir être remboursé.
+     await deps.repository.savePayment(attemptId, token, proof);
+     a = (await deps.repository.getAttempt(attemptId))!;
++
++    if (proof.currency !== 'cad' || proof.amountPaidCents !== a.quote.dueToday.totalCents) {
++      await compensate(a, token, 'montant_non_conforme', deps);
++      return 'rejected';
++    }
++    // Payée après l'expiration de sa session (remplacée par une autre inscription) : remboursée.
++    if (a.abandonedAt) {
++      await compensate(a, token, 'paye_apres_abandon', deps);
++      return 'rejected';
++    }
+     const eligibility = await deps.repository.checkEligibility(a.email, a.phone, proof.customerId);
+-    if (eligibility === 'active' || eligibility === 'refused') {
++    if (eligibility === 'active' || eligibility === 'refused' || eligibility === 'returning') {
+       await compensate(a, token, `inscription_${eligibility}`, deps);
+       return 'rejected';
+     }
++
+     let sub = a.stripeSubscriptionId
+       ? { subscriptionId: a.stripeSubscriptionId, priceId: a.stripePriceId!, status: a.stripeStatus! }
+       : await deps.billing.findSubscriptionForAttempt(proof.customerId, attemptId);
+diff --git a/supabase/functions/_shared/services/ports.ts b/supabase/functions/_shared/services/ports.ts
+index b7ca336..6badaa2 100644
+--- a/supabase/functions/_shared/services/ports.ts
++++ b/supabase/functions/_shared/services/ports.ts
+@@ -19,11 +19,26 @@ export interface SignupInput {
+   cancelUrl: string;
+ }
+ export type Eligibility = 'new' | 'returning' | 'review' | 'active' | 'refused';
++
+ /** Erreur définitive Stripe : impossible d'honorer le devis encaissé. */
+ export class BillingTerminalError extends Error {
+   readonly reason: string;
+   constructor(reason: string) { super(reason); this.name = 'BillingTerminalError'; this.reason = reason; }
+ }
++
++/**
++ * Refus d'une inscription, avant tout paiement. public-api traduit le code en
++ * message pour le site.
++ * - returning_client : ancien client → réouverture par l'application, où il est authentifié
++ * - not_allowed : dossier déjà ouvert, ou client refusé définitivement
++ * - payment_in_progress : un paiement pour ce courriel est en cours de traitement
++ */
++export type SignupErrorCode = 'returning_client' | 'not_allowed' | 'payment_in_progress';
++export class SignupError extends Error {
++  readonly code: SignupErrorCode;
++  constructor(code: SignupErrorCode) { super(code); this.name = 'SignupError'; this.code = code; }
++}
++
+ export interface PaymentProof {
+   sessionId: string;
+   attemptId: string;
+@@ -37,6 +52,11 @@ export interface PaymentProof {
+   paidAt: string | null;
+ }
+ export interface StripeSubscriptionRecord { subscriptionId: string; priceId: string; status: string }
++
++/** Statuts d'un remboursement Stripe. Seuls pending et succeeded permettent d'enregistrer un refus. */
++export type RefundStatus = 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
++export interface RefundResult { refundId: string; status: RefundStatus; amountCents: number }
++
+ export interface CheckoutAttempt {
+   id: string;
+   createdAt: string;
+@@ -53,19 +73,28 @@ export interface CheckoutAttempt {
+   stripeSubscriptionId: string | null;
+   stripePriceId: string | null;
+   stripeStatus: string | null;
++  paidAmountCents: number | null;
+   paidAt: string | null;
+   completedAt: string | null;
+   rejectedAt: string | null;
++  abandonedAt: string | null;
+   refundId: string | null;
+ }
+-export interface BillingFact {
++
++/** Signal d'un événement d'abonnement : l'état réel est relu chez Stripe. */
++export interface SubscriptionSignal {
+   eventId: string;
+   type: 'invoice.paid' | 'invoice.payment_failed' |
+     'customer.subscription.updated' | 'customer.subscription.deleted';
+   subscriptionId: string;
+-  status?: string;
+-  occurredAt: string;
+ }
++/** État d'abonnement lu chez Stripe, avec l'heure du début de la lecture. */
++export interface SubscriptionState extends SubscriptionSignal { status: string; readAt: string }
++export interface RefundSignal { refundId: string; status: RefundStatus }
++
++/** Ce que donne la tentative d'expirer une session de paiement chez Stripe. */
++export type SessionExpiry = 'expired' | 'already_expired' | 'completed';
++
+ export interface BillingGateway {
+   createCheckoutSession(input: {
+     attemptId: string;
+@@ -73,11 +102,12 @@ export interface BillingGateway {
+     lines: ReadonlyArray<{ label: string; amountCents: number }>;
+     successUrl: string;
+     cancelUrl: string;
+-    existingCustomerId?: string;
+     /** Date du prochain prélèvement (quote.recurring.nextChargeOn) : la session expire avant. */
+     payBefore: IsoDate;
+   }): Promise<{ sessionId: string; url: string }>;
+   getCheckoutSession(sessionId: string): Promise<{ sessionId: string; url: string | null }>;
++  /** Empêche une session de paiement d'être payée (remplacement par une nouvelle). */
++  expireCheckoutSession(sessionId: string): Promise<SessionExpiry>;
+   getPaymentProof(sessionId: string): Promise<PaymentProof>;
+   findSubscriptionForAttempt(customerId: string, attemptId: string): Promise<StripeSubscriptionRecord | null>;
+   createSubscription(input: {
+@@ -91,20 +121,27 @@ export interface BillingGateway {
+     /** Heure du paiement : décide du traitement tardif (après l'ancrage). */
+     paidAt: string;
+   }): Promise<StripeSubscriptionRecord>;
+-  refund(input: { attemptId: string; paymentIntentId: string; amountCents?: number; reason: string }): Promise<string>;
++  /** Rembourse exactement amountCents (le montant payé). Ne rembourse jamais deux fois. */
++  refund(input: { attemptId: string; paymentIntentId: string; amountCents: number; reason: string }): Promise<RefundResult>;
+   cancelSubscription(subscriptionId: string, attemptId: string): Promise<void>;
++  getSubscriptionStatus(subscriptionId: string): Promise<{ status: string; readAt: string }>;
+ }
++
+ export interface CheckoutRepository {
+   checkEligibility(email: string, phone: string, customerId?: string): Promise<Eligibility>;
+-  existingCustomerId(email: string): Promise<string | null>;
+   createAttempt(input: SignupInput, quote: CheckoutQuote): Promise<CheckoutAttempt>;
+   getAttempt(attemptId: string): Promise<CheckoutAttempt | null>;
++  /** Tentative ouverte (ni terminée, ni refusée, ni abandonnée) pour un courriel. */
++  openAttemptFor(email: string): Promise<string | null>;
++  /** Abandonne une tentative jamais payée, après l'expiration de sa session chez Stripe. */
++  abandon(attemptId: string): Promise<void>;
+   saveSession(attemptId: string, sessionId: string): Promise<void>;
+   claim(attemptId: string, token: string): Promise<boolean>;
+   savePayment(attemptId: string, token: string, proof: PaymentProof): Promise<void>;
+   saveSubscription(attemptId: string, token: string, subscription: StripeSubscriptionRecord): Promise<void>;
+   complete(attemptId: string, token: string, eventId: string, invitationExpiresAt: string): Promise<string | null>;
+-  reject(attemptId: string, token: string, refundId: string, reason: string): Promise<void>;
++  reject(attemptId: string, token: string, refund: RefundResult, reason: string): Promise<void>;
+   release(attemptId: string, token: string): Promise<void>;
+-  recordFact(fact: BillingFact): Promise<boolean>;
++  applySubscriptionState(state: SubscriptionState): Promise<boolean>;
++  updateRefundStatus(signal: RefundSignal): Promise<boolean>;
+ }
+diff --git a/supabase/functions/_shared/services/start-checkout.ts b/supabase/functions/_shared/services/start-checkout.ts
+index 0c30958..3947a26 100644
+--- a/supabase/functions/_shared/services/start-checkout.ts
++++ b/supabase/functions/_shared/services/start-checkout.ts
+@@ -1,5 +1,5 @@
+ import { quoteCheckout, type CheckoutQuote } from '../domain/pricing/mod.ts';
+-import type { BillingGateway, CheckoutRepository, SignupInput } from './ports.ts';
++import { type BillingGateway, type CheckoutRepository, SignupError, type SignupInput } from './ports.ts';
+ 
+ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+ 
+@@ -52,7 +52,10 @@ export async function startCheckout(
+     }
+   } else {
+     const eligibility = await deps.repository.checkEligibility(normalizedInput.email, input.phone);
+-    if (eligibility === 'active' || eligibility === 'refused') throw new Error('Inscription non admissible');
++    // Ancien client : jamais de réouverture sur la foi d'un courriel tapé sur le site.
++    if (eligibility === 'returning') throw new SignupError('returning_client');
++    if (eligibility === 'active' || eligibility === 'refused') throw new SignupError('not_allowed');
++    await replaceOpenAttempt(normalizedInput.email, deps);
+   }
+   const quote = existing?.quote ?? prepareQuote(normalizedInput, today);
+   const lines = quote.dueToday.lines.map(line => ({
+@@ -63,13 +66,32 @@ export async function startCheckout(
+       lines.reduce((sum, line) => sum + line.amountCents, 0) !== quote.dueToday.totalCents ||
+       quote.dueToday.totalCents <= 0) throw new Error('Récapitulatif invalide');
+   if (!existing) await deps.repository.createAttempt(normalizedInput, quote);
+-  const customerId = await deps.repository.existingCustomerId(normalizedInput.email);
++  // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
+   const result = await deps.billing.createCheckoutSession({
+     attemptId: input.attemptId, email: normalizedInput.email, lines,
+     successUrl: input.successUrl, cancelUrl: input.cancelUrl,
+     payBefore: quote.recurring.nextChargeOn,
+-    ...(customerId ? { existingCustomerId: customerId } : {}),
+   });
+   await deps.repository.saveSession(input.attemptId, result.sessionId);
+   return { ...result, attemptId: input.attemptId, quote };
+ }
++
++/**
++ * Une seule inscription ouverte par courriel. Une nouvelle demande remplace
++ * l'ancienne : sa session Stripe est d'abord expirée (elle ne pourra plus être
++ * payée), puis la tentative est abandonnée. Si l'ancienne a déjà été payée,
++ * on attend son traitement au lieu de faire payer une deuxième fois.
++ */
++async function replaceOpenAttempt(
++  email: string, deps: { billing: BillingGateway; repository: CheckoutRepository },
++): Promise<void> {
++  const openId = await deps.repository.openAttemptFor(email);
++  if (!openId) return;
++  const open = await deps.repository.getAttempt(openId);
++  if (!open || open.paidAt) throw new SignupError('payment_in_progress');
++  if (open.stripeSessionId) {
++    const outcome = await deps.billing.expireCheckoutSession(open.stripeSessionId);
++    if (outcome === 'completed') throw new SignupError('payment_in_progress');
++  }
++  await deps.repository.abandon(openId);
++}
+diff --git a/supabase/functions/_shared/services/sync-billing.ts b/supabase/functions/_shared/services/sync-billing.ts
+new file mode 100644
+index 0000000..e9fe58f
+--- /dev/null
++++ b/supabase/functions/_shared/services/sync-billing.ts
+@@ -0,0 +1,20 @@
++import type { BillingGateway, CheckoutRepository, RefundSignal, SubscriptionSignal } from './ports.ts';
++
++/**
++ * Événement d'abonnement ou de facture : l'événement n'est qu'un signal. L'état
++ * actuel est relu chez Stripe, puis appliqué avec l'heure de cette lecture;
++ * l'ordre d'arrivée des événements ne compte donc plus.
++ * Erreur si le dossier n'existe pas encore : Stripe renverra l'événement.
++ */
++export async function syncSubscription(
++  signal: SubscriptionSignal,
++  deps: { billing: BillingGateway; repository: CheckoutRepository },
++): Promise<boolean> {
++  const { status, readAt } = await deps.billing.getSubscriptionStatus(signal.subscriptionId);
++  return await deps.repository.applySubscriptionState({ ...signal, status, readAt });
++}
++
++/** Suivi d'un remboursement : un échec fait apparaître l'inscription « à traiter ». */
++export async function syncRefund(signal: RefundSignal, deps: { repository: CheckoutRepository }): Promise<boolean> {
++  return await deps.repository.updateRefundStatus(signal);
++}
+diff --git a/supabase/functions/tests/domain/pricing/fixtures_test.ts b/supabase/functions/tests/domain/pricing/fixtures_test.ts
+index 04d9e1b..0a17cca 100644
+--- a/supabase/functions/tests/domain/pricing/fixtures_test.ts
++++ b/supabase/functions/tests/domain/pricing/fixtures_test.ts
+@@ -1,5 +1,5 @@
+ import { assertEquals } from "./assert.ts";
+-import { grantTerms } from "../../../_shared/domain/pricing/mod.ts";
++import { grantTerms, quoteCheckout } from "../../../_shared/domain/pricing/mod.ts";
+ 
+ /**
+  * Garde-fou en attendant le test d'intégration de stripe-webhook : les
+@@ -42,3 +42,30 @@ Deno.test("tests SQL : les conditions de handle_checkout_completed suivent grant
+   }
+   assertEquals(found >= 9, true, `seulement ${found} appels trouvés : le format des tests SQL a changé ?`);
+ });
++
++/**
++ * Même garde-fou pour les récapitulatifs enregistrés dans checkout_attempts :
++ * chaque JSON de checkout_attempts.test.sql doit être exactement la sortie de
++ * quoteCheckout() du 20 octobre 2026 pour le même choix.
++ */
++const QUOTE = /\('(\w+)',\s*'(\{"terms".*?\})'\)/g;
++const QUOTE_DAY = "2026-10-20";
++const DRIVER = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false, monthlyTransactions: 12 };
++
++Deno.test("tests SQL : les récapitulatifs de checkout_attempts suivent quoteCheckout()", async () => {
++  const sql = await Deno.readTextFile(new URL("../../../../tests/rls/checkout_attempts.test.sql", import.meta.url));
++  let found = 0;
++  for (const m of sql.matchAll(QUOTE)) {
++    found++;
++    const stored = JSON.parse(m[2]);
++    const expected = quoteCheckout({
++      planCode: stored.terms.planCode,
++      billingOption: stored.terms.billingOption,
++      startMonth: stored.startsOn === "2026-10-01" ? "current" : "next",
++      today: QUOTE_DAY,
++      trajetProfile: DRIVER,
++    });
++    assertEquals(stored, JSON.parse(JSON.stringify(expected)), m[1]);
++  }
++  assertEquals(found >= 2, true, `seulement ${found} récapitulatifs trouvés`);
++});
+diff --git a/supabase/functions/tests/domain/pricing/grid_test.ts b/supabase/functions/tests/domain/pricing/grid_test.ts
+index 38a173e..16e5f69 100644
+--- a/supabase/functions/tests/domain/pricing/grid_test.ts
++++ b/supabase/functions/tests/domain/pricing/grid_test.ts
+@@ -63,11 +63,9 @@ Deno.test("conditions accordées : instantané complet pour la base et Stripe",
+     openingFeeCents: 7500,
+     openingDiscountCents: 7400,
+     stripeRecurringLookupKey: "elan_annual_2026_10",
+-    stripeOpeningLookupKey: "opening_elan_reduced_2026_10",
+   });
+   const monthly = grantTerms("depart", "monthly");
+   assertEquals(monthly.stripeRecurringLookupKey, "depart_monthly_2026_10");
+-  assertEquals(monthly.stripeOpeningLookupKey, "opening_depart_full_2026_10");
+   // Le mensuel avec engagement utilise le même prix récurrent que le mensuel.
+   assertEquals(grantTerms("depart", "monthly_commitment").stripeRecurringLookupKey, "depart_monthly_2026_10");
+ });
+diff --git a/supabase/functions/tests/integrations/stripe/webhook_test.ts b/supabase/functions/tests/integrations/stripe/webhook_test.ts
+index eace84a..5882978 100644
+--- a/supabase/functions/tests/integrations/stripe/webhook_test.ts
++++ b/supabase/functions/tests/integrations/stripe/webhook_test.ts
+@@ -1,6 +1,6 @@
+ import { assertEquals } from '../../domain/pricing/assert.ts';
+ import { Stripe } from '../../../_shared/integrations/stripe/client.ts';
+-import { billingFact, checkoutEvent, verifyWebhook } from '../../../_shared/integrations/stripe/webhook.ts';
++import { checkoutEvent, refundSignal, subscriptionSignal, verifyWebhook } from '../../../_shared/integrations/stripe/webhook.ts';
+ 
+ const secret = 'whsec_local_test_signature_only';
+ const sign = (payload: string) =>
+@@ -17,24 +17,36 @@ Deno.test('signature : valide acceptée, falsifiée refusée, sans clé secrète
+   });
+   const verified = await verifyWebhook(data, await sign(data));
+   assertEquals(checkoutEvent(verified), { attemptId: '22222222-2222-4222-8222-222222222222' });
+-  assertEquals(billingFact(verified), null);
++  assertEquals(subscriptionSignal(verified), null);
++  assertEquals(refundSignal(verified), null);
+   let rejected = false;
+   try { await verifyWebhook(data + ' ', await sign(data)); } catch { rejected = true; }
+   assertEquals(rejected, true);
+ });
+ 
+-Deno.test('faits de facturation : seulement les abonnements créés par une inscription', async () => {
++Deno.test('signaux d\'abonnement : seulement les inscriptions, jamais le statut de l\'événement', async () => {
+   Deno.env.set('STRIPE_WEBHOOK_SECRET', secret);
+   const ours = event('invoice.paid', { id: 'in_1', object: 'invoice',
+     parent: { subscription_details: { subscription: 'sub_1', metadata: { attempt_id: 'a1' } } } });
+   const other = event('invoice.paid', { id: 'in_2', object: 'invoice',
+     parent: { subscription_details: { subscription: 'sub_2', metadata: {} } } });
+-  const fact = billingFact(await verifyWebhook(ours, await sign(ours)));
+-  assertEquals(fact?.subscriptionId, 'sub_1');
+-  assertEquals(billingFact(await verifyWebhook(other, await sign(other))), null);
++  assertEquals(subscriptionSignal(await verifyWebhook(ours, await sign(ours))),
++    { eventId: 'evt_invoice.paid', type: 'invoice.paid', subscriptionId: 'sub_1' });
++  assertEquals(subscriptionSignal(await verifyWebhook(other, await sign(other))), null);
+   const updated = event('customer.subscription.updated', { id: 'sub_1', object: 'subscription',
+     status: 'past_due', metadata: { attempt_id: 'a1' } });
+-  assertEquals(billingFact(await verifyWebhook(updated, await sign(updated)))?.status, 'past_due');
++  assertEquals(subscriptionSignal(await verifyWebhook(updated, await sign(updated))),
++    { eventId: 'evt_customer.subscription.updated', type: 'customer.subscription.updated', subscriptionId: 'sub_1' });
++});
++
++Deno.test('remboursements : seulement ceux d\'une inscription, avec un statut connu', async () => {
++  Deno.env.set('STRIPE_WEBHOOK_SECRET', secret);
++  const failed = event('refund.failed', { id: 're_1', object: 'refund', status: 'failed', metadata: { attempt_id: 'a1' } });
++  const other = event('refund.updated', { id: 're_2', object: 'refund', status: 'succeeded', metadata: {} });
++  const odd = event('refund.updated', { id: 're_3', object: 'refund', status: 'bizarre', metadata: { attempt_id: 'a1' } });
++  assertEquals(refundSignal(await verifyWebhook(failed, await sign(failed))), { refundId: 're_1', status: 'failed' });
++  assertEquals(refundSignal(await verifyWebhook(other, await sign(other))), null);
++  assertEquals(refundSignal(await verifyWebhook(odd, await sign(odd))), null);
+ });
+ 
+ Deno.test('le SDK Stripe n\'est importé que dans integrations/stripe', async () => {
+diff --git a/supabase/functions/tests/services/checkout_test.ts b/supabase/functions/tests/services/checkout_test.ts
+index 727e632..bc8b7b9 100644
+--- a/supabase/functions/tests/services/checkout_test.ts
++++ b/supabase/functions/tests/services/checkout_test.ts
+@@ -1,9 +1,12 @@
++// deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import type { CheckoutAttempt, CheckoutQuote, Eligibility, PaymentProof, SignupInput,
+-  StripeSubscriptionRecord, BillingFact, CheckoutRepository } from '../../_shared/services/ports.ts';
++import type { CheckoutAttempt, CheckoutQuote, Eligibility, PaymentProof, SignupInput, RefundResult,
++  RefundSignal, StripeSubscriptionRecord, SubscriptionState, CheckoutRepository } from '../../_shared/services/ports.ts';
++import { SignupError } from '../../_shared/services/ports.ts';
+ import { startCheckout, prepareQuote } from '../../_shared/services/start-checkout.ts';
+ import { completeCheckout } from '../../_shared/services/complete-checkout.ts';
++import { syncRefund, syncSubscription } from '../../_shared/services/sync-billing.ts';
+ import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
+ import { torontoMidnight } from '../../_shared/integrations/stripe/time.ts';
+ 
+@@ -13,30 +16,47 @@ const input = (extra: Partial<SignupInput> = {}): SignupInput => ({
+   startMonth: 'current', booksUpToDate: true, usesQuickbooks: false,
+   estimatedTransactions: 14, successUrl: 'https://example.ca/success', cancelUrl: 'https://example.ca/cancel', ...extra,
+ });
++const SECOND = '0b6d9f0e-3c1a-4f7e-9a51-6c2d8e4f1a20';
++
++/** Mêmes règles que les fonctions SQL, en mémoire. */
+ class FakeRepository implements CheckoutRepository {
+   attempts = new Map<string, CheckoutAttempt>();
+   eligibility: Eligibility = 'new';
+   token: string | null = null;
+   completeCalls = 0;
+   failOnce = false;
++  reasons = new Map<string, string>();
++  refundStatus = new Map<string, string>();
++  states: SubscriptionState[] = [];
+   checkEligibility(): Promise<Eligibility> { return Promise.resolve(this.eligibility); }
+-  existingCustomerId(): Promise<string | null> { return Promise.resolve(null); }
+   async createAttempt(i: SignupInput, quote: CheckoutQuote) {
++    if (await this.openAttemptFor(i.email)) throw new Error('P0005 tentative ouverte');
+     const attempt: CheckoutAttempt = { id: i.attemptId, createdAt: new Date().toISOString(),
+       email: i.email, phone: i.phone, displayName: i.displayName,
+       booksUpToDate: i.booksUpToDate, usesQuickbooks: i.usesQuickbooks,
+       estimatedTransactions: i.estimatedTransactions, quote,
+       stripeSessionId: null, stripeCustomerId: null, stripePaymentIntentId: null,
+-      stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null,
+-      paidAt: null, completedAt: null, rejectedAt: null, refundId: null };
++      stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null, paidAmountCents: null,
++      paidAt: null, completedAt: null, rejectedAt: null, abandonedAt: null, refundId: null };
+     this.attempts.set(i.attemptId, attempt); return attempt;
+   }
+   getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
++  openAttemptFor(email: string) {
++    const open = [...this.attempts.values()].find(a => a.email === email &&
++      !a.completedAt && !a.rejectedAt && !a.abandonedAt);
++    return Promise.resolve(open?.id ?? null);
++  }
++  async abandon(id: string) {
++    const a = this.attempts.get(id)!;
++    if (a.paidAt || this.token) throw new Error('P0001 tentative payée ou verrouillée');
++    a.abandonedAt = new Date().toISOString();
++  }
+   async saveSession(id: string, sessionId: string) { this.attempts.get(id)!.stripeSessionId = sessionId; }
+   async claim(_id: string, token: string) { if (this.token) return false; this.token = token; return true; }
+   async savePayment(id: string, _token: string, proof: PaymentProof) {
+     const a = this.attempts.get(id)!;
+-    a.stripeCustomerId = proof.customerId; a.stripePaymentIntentId = proof.paymentIntentId; a.paidAt = new Date().toISOString();
++    a.stripeCustomerId = proof.customerId; a.stripePaymentIntentId = proof.paymentIntentId;
++    a.paidAt = proof.paidAt; a.paidAmountCents = proof.amountPaidCents;
+   }
+   async saveSubscription(id: string, _token: string, s: StripeSubscriptionRecord) {
+     const a = this.attempts.get(id)!;
+@@ -48,13 +68,24 @@ class FakeRepository implements CheckoutRepository {
+     this.attempts.get(id)!.completedAt = new Date().toISOString();
+     return 'client_id';
+   }
+-  async reject(id: string, _token: string, refundId: string) {
+-    this.attempts.get(id)!.rejectedAt = new Date().toISOString();
+-    this.attempts.get(id)!.refundId = refundId;
++  async reject(id: string, _token: string, refund: RefundResult, reason: string) {
++    const a = this.attempts.get(id)!;
++    // Mêmes exigences que checkout_attempt_reject.
++    if (!['pending', 'succeeded'].includes(refund.status) || refund.amountCents !== a.paidAmountCents) {
++      throw new Error('22023 remboursement non conforme');
++    }
++    a.rejectedAt = new Date().toISOString(); a.refundId = refund.refundId;
++    this.reasons.set(id, reason); this.refundStatus.set(refund.refundId, refund.status);
+   }
+   async release() { this.token = null; }
+-  async recordFact(_fact: BillingFact) { return true; }
++  async applySubscriptionState(state: SubscriptionState) { this.states.push(state); return true; }
++  async updateRefundStatus(signal: RefundSignal) {
++    if (!this.refundStatus.has(signal.refundId)) return false;
++    this.refundStatus.set(signal.refundId, signal.status); return true;
++  }
+ }
++const deps = (repo: FakeRepository, stripe: FakeStripeGateway) => ({ repository: repo, billing: stripe });
++const signupError = (code: string) => (error: unknown) => error instanceof SignupError && error.code === code;
+ 
+ test('prix mensuel courant fourni par pricing, aucun recalcul Stripe', async () => {
+   const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
+@@ -155,3 +186,99 @@ test('une tentative identique récupère la même session et le même devis', as
+   assert.equal(b.quote.startsOn,'2026-10-01');
+   assert.equal(stripe.checkoutCreates, 1);
+ });
++
++test('ancien client : renvoyé vers l\'application, aucune session ni client Stripe', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway(); repo.eligibility = 'returning';
++  await assert.rejects(startCheckout(input(), deps(repo, stripe), '2026-10-20'), signupError('returning_client'));
++  repo.eligibility = 'active';
++  await assert.rejects(startCheckout(input(), deps(repo, stripe), '2026-10-20'), signupError('not_allowed'));
++  assert.equal(stripe.checkoutCreates, 0);
++  assert.equal(repo.attempts.size, 0);
++});
++
++test('nouvelle demande pour le même courriel : l\'ancienne session expire, puis est abandonnée', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  const first = await startCheckout(input(), deps(repo, stripe), '2026-10-20');
++  const second = await startCheckout(input({ attemptId: SECOND, planCode: 'elan' }), deps(repo, stripe), '2026-10-20');
++  assert.equal(stripe.sessionStatus.get(first.sessionId), 'expired');
++  assert.ok(repo.attempts.get(input().attemptId)!.abandonedAt);
++  assert.equal(await repo.openAttemptFor('test@example.ca'), SECOND);
++  assert.notEqual(first.sessionId, second.sessionId);
++});
++
++test('ancienne demande déjà payée, ou payée pendant le remplacement : aucun deuxième paiement', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  const first = await startCheckout(input(), deps(repo, stripe), '2026-10-20');
++  stripe.sessionStatus.set(first.sessionId, 'complete');           // payée chez Stripe, webhook pas encore traité
++  await assert.rejects(startCheckout(input({ attemptId: SECOND }), deps(repo, stripe), '2026-10-20'),
++    signupError('payment_in_progress'));
++  assert.equal(repo.attempts.get(input().attemptId)!.abandonedAt, null);
++  assert.equal(await completeCheckout(input().attemptId, 'evt_paid', deps(repo, stripe)), 'completed');
++
++  const repo2 = new FakeRepository(); const stripe2 = new FakeStripeGateway();
++  await startCheckout(input(), deps(repo2, stripe2), '2026-10-20');
++  repo2.attempts.get(input().attemptId)!.paidAt = new Date().toISOString();   // paiement enregistré
++  await assert.rejects(startCheckout(input({ attemptId: SECOND }), deps(repo2, stripe2), '2026-10-20'),
++    signupError('payment_in_progress'));
++  assert.equal(stripe2.checkoutCreates, 1);
++});
++
++test('remboursement échoué ou partiel : rien n\'est enregistré, la reprise rembourse au complet', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  await startCheckout(input(), deps(repo, stripe), '2026-10-20');
++  repo.eligibility = 'refused';
++  stripe.nextRefundStatus = 'failed';
++  await assert.rejects(completeCheckout(input().attemptId, 'evt_r1', deps(repo, stripe)), /non accepté/);
++  assert.equal(repo.attempts.get(input().attemptId)!.rejectedAt, null);
++
++  stripe.nextRefundStatus = 'pending'; stripe.nextRefundAmountCents = 100;
++  await assert.rejects(completeCheckout(input().attemptId, 'evt_r2', deps(repo, stripe)), /incomplet/);
++  assert.equal(repo.attempts.get(input().attemptId)!.rejectedAt, null);
++
++  stripe.nextRefundAmountCents = null;
++  stripe.refunds.get(input().attemptId)!.status = 'canceled';      // le partiel a été annulé
++  assert.equal(await completeCheckout(input().attemptId, 'evt_r3', deps(repo, stripe)), 'rejected');
++  const a = repo.attempts.get(input().attemptId)!;
++  assert.equal(stripe.refunds.get(input().attemptId)!.amountCents, a.paidAmountCents);
++  assert.equal(stripe.refundCreates, 3);
++  assert.equal(await completeCheckout(input().attemptId, 'evt_r3', deps(repo, stripe)), 'rejected');
++  assert.equal(stripe.refundCreates, 3);
++});
++
++test('ancien client détecté au paiement, ou paiement après abandon : remboursé, aucun abonnement', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  await startCheckout(input(), deps(repo, stripe), '2026-10-20');
++  repo.eligibility = 'returning';
++  assert.equal(await completeCheckout(input().attemptId, 'evt_ret', deps(repo, stripe)), 'rejected');
++  assert.equal(repo.reasons.get(input().attemptId), 'inscription_returning');
++
++  const repo2 = new FakeRepository(); const stripe2 = new FakeStripeGateway();
++  await startCheckout(input(), deps(repo2, stripe2), '2026-10-20');
++  repo2.attempts.get(input().attemptId)!.abandonedAt = new Date().toISOString();
++  assert.equal(await completeCheckout(input().attemptId, 'evt_ab', deps(repo2, stripe2)), 'rejected');
++  assert.equal(repo2.reasons.get(input().attemptId), 'paye_apres_abandon');
++  assert.equal(stripe2.refunds.get(input().attemptId)!.amountCents, 17800);
++  assert.equal(stripe2.subscriptionCreates, 0);
++  assert.equal(stripe.subscriptionCreates, 0);
++});
++
++test('abonnement : le statut appliqué est celui relu chez Stripe, avec l\'heure de lecture', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  stripe.nowSeconds = torontoMidnight('2026-11-03');
++  stripe.subscriptionStatus.set('sub_x', 'active');
++  await syncSubscription({ eventId: 'evt_old', type: 'invoice.payment_failed', subscriptionId: 'sub_x' }, deps(repo, stripe));
++  assert.equal(repo.states[0].status, 'active');
++  assert.equal(repo.states[0].readAt, new Date(torontoMidnight('2026-11-03') * 1000).toISOString());
++  assert.equal(repo.states[0].eventId, 'evt_old');
++});
++
++test('suivi du remboursement : seul un remboursement connu est mis à jour', async () => {
++  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
++  await startCheckout(input(), deps(repo, stripe), '2026-10-20');
++  repo.eligibility = 'refused'; stripe.nextRefundStatus = 'pending';
++  await completeCheckout(input().attemptId, 'evt_p', deps(repo, stripe));
++  const refundId = repo.attempts.get(input().attemptId)!.refundId!;
++  assert.equal(await syncRefund({ refundId, status: 'failed' }, { repository: repo }), true);
++  assert.equal(repo.refundStatus.get(refundId), 'failed');
++  assert.equal(await syncRefund({ refundId: 're_inconnu', status: 'failed' }, { repository: repo }), false);
++});
+diff --git a/supabase/migrations/20261020000900_checkout_attempts.sql b/supabase/migrations/20261020000900_checkout_attempts.sql
+new file mode 100644
+index 0000000..2663cd6
+--- /dev/null
++++ b/supabase/migrations/20261020000900_checkout_attempts.sql
+@@ -0,0 +1,542 @@
++-- =============================================================================
++-- Tentatives d'inscription payées par Stripe
++--
++-- Une tentative est une fiche temporaire : elle garde le récapitulatif calculé
++-- par domain/pricing (quoteCheckout) au moment où le client a vu son prix.
++-- Le webhook ne recalcule jamais rien : il relit la tentative et crée le
++-- dossier client avec ces conditions. Le dossier garde ensuite tout ce qui
++-- compte; la tentative est purgée après 30 ou 90 jours (Loi 25).
++--
++-- États : créée → session Stripe → payée → abonnement créé → terminée,
++-- ou refusée (remboursée), ou abandonnée (jamais payée).
++--
++-- Règles de sécurité :
++-- - un ancien client ne se réinscrit pas par le site (il passe par l'application,
++--   où il est authentifié) : aucune réouverture sur la seule foi d'un courriel;
++-- - une seule tentative ouverte par courriel;
++-- - un refus n'est enregistré qu'avec un remboursement du montant payé.
++--
++-- Aucune règle tarifaire n'est calculée en SQL; la cohérence du récapitulatif
++-- est seulement vérifiée. Écritures : rôle service seulement.
++-- =============================================================================
++
++-- -----------------------------------------------------------------------------
++-- Récapitulatif complet ET cohérent, vérifié avant le paiement
++-- -----------------------------------------------------------------------------
++create function private.is_valid_checkout_quote(q jsonb)
++returns boolean language plpgsql immutable set search_path = ''
++as $$
++declare
++  t            jsonb := q -> 'terms';
++  v_plan       text;
++  v_billing    text;
++  v_cycle      text;
++  v_recurring  integer;
++  v_opening    integer;
++  v_total      integer;
++  v_sum        integer;
++  v_starts     date;
++  v_next       date;
++  v_has_first  boolean;
++  v_first      integer;
++begin
++  -- Toute condition inconnue (clé absente → NULL) compte comme invalide : « is not false ».
++  if (jsonb_typeof(q) <> 'object' or jsonb_typeof(t) <> 'object') is not false then return false; end if;
++
++  v_plan      := t ->> 'planCode';
++  v_billing   := t ->> 'billingOption';
++  v_cycle     := t ->> 'cycle';
++  v_recurring := (t ->> 'recurringPriceCents')::integer;
++  v_opening   := (t ->> 'openingFeeCents')::integer;
++  v_total     := (q #>> '{dueToday,totalCents}')::integer;
++  v_starts    := (q ->> 'startsOn')::date;
++  v_next      := (q #>> '{recurring,nextChargeOn}')::date;
++
++  -- Champs présents et bien formés
++  if (v_plan not in ('trajet', 'depart', 'elan', 'envol')
++     or v_billing not in ('monthly', 'monthly_commitment', 'annual')
++     or (t ->> 'gridVersion') !~ '^\d{4}-\d{2}$'
++     or (t ->> 'includedFilingFrequency') not in ('monthly', 'quarterly', 'annual')
++     or jsonb_typeof(t -> 'quickbooksIncluded') <> 'boolean'
++     or (t ->> 'includedTransactions')::integer <= 0
++     or (t ->> 'includedAccounts')::integer <= 0
++     or (t ->> 'extraTransactionCents')::integer < 0
++     or (t ->> 'extraAccountCents')::integer < 0
++     or (t ->> 'extraFilingCents')::integer < 0
++     or (t ->> 'openingDiscountCents')::integer < 0
++     or v_recurring <= 0 or v_opening < 0 or v_total <= 0
++     or extract(day from v_starts) <> 1 or extract(day from v_next) <> 1
++ ) is not false then return false; end if;
++
++  -- Facturation : Trajet au mois seulement, l'annuel facture à l'année
++  if (v_plan = 'trajet' and v_billing <> 'monthly') is not false then return false; end if;
++  if (v_cycle <> (case when v_billing = 'annual' then 'year' else 'month' end)) is not false then return false; end if;
++  if ((q #>> '{recurring,cycle}') is distinct from v_cycle
++     or (q #>> '{recurring,amountCents}')::integer is distinct from v_recurring) is not false then return false; end if;
++  if ((t ->> 'stripeRecurringLookupKey') is distinct from
++     (v_plan || '_' || (case when v_billing = 'annual' then 'annual' else 'monthly' end) || '_'
++            || replace(t ->> 'gridVersion', '-', '_'))) is not false then return false; end if;
++
++  -- Lignes du jour : l'ouverture, et le premier cycle seulement si le mois en cours est traité
++  if (jsonb_typeof(q #> '{dueToday,lines}') <> 'array') is not false then return false; end if;
++  select coalesce(sum((l ->> 'amountCents')::integer), 0),
++         bool_or(l ->> 'kind' = 'first_period'),
++         max(case when l ->> 'kind' = 'first_period' then (l ->> 'amountCents')::integer end)
++    into v_sum, v_has_first, v_first
++    from jsonb_array_elements(q #> '{dueToday,lines}') l;
++  if (v_sum <> v_total) is not false then return false; end if;
++  if ((select count(*) from jsonb_array_elements(q #> '{dueToday,lines}') l
++       where l ->> 'kind' = 'opening_fee' and (l ->> 'amountCents')::integer = v_opening) <> 1) is not false then return false; end if;
++  if ((select count(*) from jsonb_array_elements(q #> '{dueToday,lines}') l
++       where l ->> 'kind' not in ('opening_fee', 'first_period')) > 0) is not false then return false; end if;
++
++  if coalesce(v_has_first, false) then
++    -- Mois en cours : le premier cycle est payé aujourd'hui, le prochain prélèvement suit d'un cycle
++    if (v_first <> v_recurring) is not false then return false; end if;
++    if (v_next <> (v_starts + (case when v_cycle = 'year' then interval '12 months' else interval '1 month' end))::date)
++       is not false then return false; end if;
++  else
++    -- Mois suivant : seule l'ouverture aujourd'hui, le premier prélèvement le jour du début
++    if (v_next <> v_starts) is not false then return false; end if;
++  end if;
++
++  return true;
++exception when others then
++  -- Champ absent, mauvais type ou valeur impossible : invalide, jamais « inconnu »
++  return false;
++end
++$$;
++
++create table public.checkout_attempts (
++  id                       uuid primary key,
++  created_at               timestamptz not null default now(),
++  email                    text not null check (email = lower(email) and email like '_%@_%'),
++  phone                    text not null check (length(trim(phone)) > 0),
++  display_name             text not null check (length(trim(display_name)) > 0),
++  books_up_to_date         boolean not null,
++  uses_quickbooks          boolean not null,
++  estimated_transactions   integer not null check (estimated_transactions >= 0),
++  granted_quote            jsonb not null check (private.is_valid_checkout_quote(granted_quote)),
++  stripe_session_id        text unique,
++  stripe_customer_id       text,
++  stripe_payment_intent_id text unique,
++  stripe_payment_method_id text,
++  paid_amount_cents        integer check (paid_amount_cents > 0),
++  paid_at                  timestamptz,
++  stripe_subscription_id   text unique,
++  stripe_price_id          text,
++  stripe_status            text,
++  subscription_created_at  timestamptz,
++  completed_at             timestamptz,
++  rejected_at              timestamptz,
++  rejection_reason         text,
++  refund_id                text unique,
++  refund_amount_cents      integer,
++  refund_status            text check (refund_status in ('pending', 'succeeded', 'failed', 'canceled', 'requires_action')),
++  abandoned_at             timestamptz,
++  anonymized_at            timestamptz,
++  lease_token              uuid,
++  lease_expires_at         timestamptz,
++  check (num_nonnulls(completed_at, rejected_at) <= 1),
++  check (abandoned_at is null or completed_at is null),
++  check (stripe_subscription_id is null or (stripe_price_id is not null and subscription_created_at is not null)),
++  check ((paid_at is null) = (paid_amount_cents is null)),
++  check (paid_at is null or stripe_payment_intent_id is not null),
++  check (completed_at is null or stripe_subscription_id is not null),
++  check (rejected_at is null or (refund_id is not null and refund_amount_cents = paid_amount_cents)),
++  check ((lease_token is null) = (lease_expires_at is null))
++);
++-- Une seule tentative ouverte par courriel (inscriptions simultanées)
++create unique index checkout_attempts_one_open_per_email on public.checkout_attempts (email)
++  where completed_at is null and rejected_at is null and abandoned_at is null;
++comment on table public.checkout_attempts is
++  'Fiches temporaires d''inscription. granted_quote : récapitulatif de domain/pricing tel que vu par le client, jamais recalculé. Le dossier client garde les informations durables; ces fiches sont purgées (purge_checkout_attempts).';
++
++alter table public.checkout_attempts enable row level security;
++revoke all on public.checkout_attempts from public, anon, authenticated;
++grant select on public.checkout_attempts to service_role;
++-- Lecture par l'administratrice seulement (double authentification exigée par is_admin)
++grant select on public.checkout_attempts to authenticated;
++create policy "admin : lecture" on public.checkout_attempts
++  for select to authenticated using ((select private.is_admin()));
++
++-- -----------------------------------------------------------------------------
++-- Création : refus avant tout paiement
++--   P0004 : dossier ouvert ou client refusé définitivement
++--   P0006 : ancien client → réouverture par l'application, pas par le site
++--   P0005 : une autre tentative est ouverte pour ce courriel (DETAIL = son id)
++--   22023 : récapitulatif incomplet ou incohérent
++-- -----------------------------------------------------------------------------
++create function public.checkout_attempt_create(
++  p_id uuid, p_email text, p_phone text, p_display_name text,
++  p_books_up_to_date boolean, p_uses_quickbooks boolean,
++  p_estimated_transactions integer, p_quote jsonb
++) returns void language plpgsql security definer set search_path = '' as $$
++declare
++  v_email text := lower(trim(p_email));
++  v_open  uuid;
++begin
++  case public.check_signup_eligibility(v_email, p_phone)
++    when 'active', 'refused' then
++      raise exception 'Inscription refusée' using errcode = 'P0004';
++    when 'returning' then
++      raise exception 'Ancien client : réouverture par l''application' using errcode = 'P0006';
++    else null;  -- 'new' ou 'review' (même téléphone : vérifié à l'appel de bienvenue)
++  end case;
++  if not private.is_valid_checkout_quote(p_quote) then
++    raise exception 'Récapitulatif incomplet ou incohérent' using errcode = '22023';
++  end if;
++
++  -- Une session Stripe vit au plus 24 h : au-delà, une tentative non payée est abandonnée.
++  update public.checkout_attempts set abandoned_at = now()
++   where email = v_email and completed_at is null and rejected_at is null and abandoned_at is null
++     and paid_at is null and created_at < now() - interval '24 hours';
++
++  select id into v_open from public.checkout_attempts
++   where email = v_email and completed_at is null and rejected_at is null and abandoned_at is null;
++  if v_open is not null then
++    raise exception 'Une inscription est déjà en cours pour ce courriel'
++      using errcode = 'P0005', detail = v_open::text;
++  end if;
++
++  insert into public.checkout_attempts
++    (id, email, phone, display_name, books_up_to_date, uses_quickbooks, estimated_transactions, granted_quote)
++  values (p_id, v_email, trim(p_phone), trim(p_display_name), p_books_up_to_date,
++          p_uses_quickbooks, p_estimated_transactions, p_quote);
++end $$;
++
++-- Tentative ouverte d'un courriel (pour reprendre ou remplacer sa session)
++create function public.checkout_attempt_open_for(p_email text)
++returns uuid language sql stable security definer set search_path = '' as $$
++  select id from public.checkout_attempts
++   where email = lower(trim(p_email)) and completed_at is null and rejected_at is null and abandoned_at is null
++$$;
++
++-- Abandon d'une tentative jamais payée (sa session Stripe a été expirée)
++create function public.checkout_attempt_abandon(p_id uuid)
++returns void language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set abandoned_at = now()
++   where id = p_id and paid_at is null and completed_at is null and rejected_at is null and abandoned_at is null
++     and (lease_token is null or lease_expires_at < now());
++  if not found then raise exception 'Tentative payée, en traitement ou déjà fermée' using errcode = 'P0001'; end if;
++end $$;
++
++create function public.checkout_attempt_save_session(p_id uuid, p_session_id text)
++returns void language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set stripe_session_id = p_session_id
++   where id = p_id and (stripe_session_id is null or stripe_session_id = p_session_id)
++     and completed_at is null and rejected_at is null and abandoned_at is null;
++  if not found then raise exception 'Session différente ou tentative fermée' using errcode = 'P0001'; end if;
++end $$;
++
++create function public.checkout_attempt_claim(p_id uuid, p_token uuid)
++returns boolean language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts
++     set lease_token = p_token, lease_expires_at = now() + interval '5 minutes'
++   where id = p_id and (lease_token is null or lease_expires_at < now() or lease_token = p_token);
++  return found;
++end $$;
++
++create function public.checkout_attempt_release(p_id uuid, p_token uuid)
++returns void language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set lease_token = null, lease_expires_at = null
++   where id = p_id and lease_token = p_token;
++end $$;
++
++-- Paiement constaté chez Stripe. Une tentative n'est abandonnée qu'après l'expiration de sa
++-- session chez Stripe, donc ne devrait jamais être payée ensuite; si c'est le cas, le
++-- paiement est quand même enregistré pour être remboursé (le service s'en charge).
++create function public.checkout_attempt_paid(
++  p_id uuid, p_token uuid, p_session_id text, p_customer_id text, p_intent_id text,
++  p_method_id text, p_amount_cents integer
++) returns void language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set
++    stripe_customer_id       = p_customer_id,
++    stripe_payment_intent_id = p_intent_id,
++    stripe_payment_method_id = p_method_id,
++    paid_amount_cents        = p_amount_cents,
++    paid_at                  = coalesce(paid_at, now())
++  where id = p_id and lease_token = p_token and lease_expires_at > now()
++    and stripe_session_id = p_session_id and rejected_at is null and completed_at is null
++    and (stripe_customer_id is null or stripe_customer_id = p_customer_id)
++    and (stripe_payment_intent_id is null or stripe_payment_intent_id = p_intent_id)
++    and (stripe_payment_method_id is null or stripe_payment_method_id = p_method_id)
++    and (paid_amount_cents is null or paid_amount_cents = p_amount_cents);
++  if not found then raise exception 'Paiement incohérent ou verrou perdu' using errcode = 'P0001'; end if;
++end $$;
++
++create function public.checkout_attempt_subscription(
++  p_id uuid, p_token uuid, p_subscription_id text, p_price_id text, p_status text
++) returns void language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set
++    stripe_subscription_id  = p_subscription_id,
++    stripe_price_id         = p_price_id,
++    stripe_status           = p_status,
++    subscription_created_at = coalesce(subscription_created_at, now())
++  where id = p_id and lease_token = p_token and lease_expires_at > now()
++    and paid_at is not null and completed_at is null and rejected_at is null and abandoned_at is null
++    and paid_amount_cents = (granted_quote #>> '{dueToday,totalCents}')::integer
++    and (stripe_subscription_id is null or stripe_subscription_id = p_subscription_id)
++    and (stripe_price_id is null or stripe_price_id = p_price_id);
++  if not found then raise exception 'Abonnement incohérent ou verrou perdu' using errcode = 'P0001'; end if;
++end $$;
++
++-- Création du dossier. L'événement Stripe est marqué traité dans la même transaction
++-- (handle_checkout_completed). Arguments nommés : un changement de signature échoue
++-- clairement au lieu de décaler les valeurs. Jamais « terminée » sans dossier retrouvé.
++create function public.checkout_attempt_finish(
++  p_id uuid, p_token uuid, p_event_id text, p_invitation_expires_at timestamptz
++) returns uuid language plpgsql security definer set search_path = '' as $$
++declare
++  a        public.checkout_attempts%rowtype;
++  t        jsonb;
++  v_client uuid;
++begin
++  select * into a from public.checkout_attempts where id = p_id for update;
++  if not found or a.lease_token is distinct from p_token or a.lease_expires_at < now() then
++    raise exception 'Verrou de tentative perdu' using errcode = 'P0001';
++  end if;
++  if a.completed_at is not null then
++    select m.client_id into v_client
++      from public.subscriptions s join public.mandates m on m.id = s.mandate_id
++     where s.stripe_subscription_id = a.stripe_subscription_id;
++    return v_client;
++  end if;
++  if a.rejected_at is not null or a.abandoned_at is not null or a.paid_at is null or a.stripe_subscription_id is null
++     or a.paid_amount_cents <> (a.granted_quote #>> '{dueToday,totalCents}')::integer then
++    raise exception 'Tentative non payée, incohérente ou refusée' using errcode = 'P0001';
++  end if;
++
++  t := a.granted_quote -> 'terms';
++  v_client := public.handle_checkout_completed(
++    p_event_id                  => p_event_id,
++    p_email                     => a.email,
++    p_display_name              => a.display_name,
++    p_plan_code                 => t ->> 'planCode',
++    p_billing_option            => (t ->> 'billingOption')::public.billing_option,
++    p_starts_on                 => (a.granted_quote ->> 'startsOn')::date,
++    p_stripe_customer_id        => a.stripe_customer_id,
++    p_stripe_subscription_id    => a.stripe_subscription_id,
++    p_stripe_status             => a.stripe_status,
++    p_books_up_to_date          => a.books_up_to_date,
++    p_uses_quickbooks           => a.uses_quickbooks,
++    p_estimated_transactions    => a.estimated_transactions,
++    p_invitation_expires_at     => p_invitation_expires_at,
++    p_recurring_price_cents     => (t ->> 'recurringPriceCents')::integer,
++    p_included_transactions     => (t ->> 'includedTransactions')::integer,
++    p_extra_transaction_cents   => (t ->> 'extraTransactionCents')::integer,
++    p_opening_fee_cents         => (t ->> 'openingFeeCents')::integer,
++    p_stripe_price_id           => a.stripe_price_id,
++    p_opening_discount_cents    => (t ->> 'openingDiscountCents')::integer,
++    p_grid_version              => t ->> 'gridVersion',
++    p_included_accounts         => (t ->> 'includedAccounts')::integer,
++    p_included_filing_frequency => (t ->> 'includedFilingFrequency')::public.filing_frequency,
++    p_quickbooks_included       => (t ->> 'quickbooksIncluded')::boolean,
++    p_extra_account_cents       => (t ->> 'extraAccountCents')::integer,
++    p_extra_filing_cents        => (t ->> 'extraFilingCents')::integer,
++    p_phone                     => a.phone
++  );
++  if v_client is null then
++    -- Événement déjà traité : le dossier doit exister pour cet abonnement.
++    select m.client_id into v_client
++      from public.subscriptions s join public.mandates m on m.id = s.mandate_id
++     where s.stripe_subscription_id = a.stripe_subscription_id;
++  end if;
++  if v_client is null then
++    raise exception 'Paiement sans dossier retrouvé pour l''abonnement %', a.stripe_subscription_id
++      using errcode = 'P0001';
++  end if;
++  update public.checkout_attempts set completed_at = now() where id = p_id;
++  return v_client;
++end $$;
++
++-- Refus : seulement avec un remboursement du montant payé, réussi ou en cours.
++-- Un remboursement en échec reste « à traiter » (refund_status, vue d'administration).
++create function public.checkout_attempt_reject(
++  p_id uuid, p_token uuid, p_refund_id text, p_refund_amount_cents integer, p_refund_status text, p_reason text
++) returns void language plpgsql security definer set search_path = '' as $$
++begin
++  if p_refund_status not in ('pending', 'succeeded') then
++    raise exception 'Remboursement non accepté par Stripe (%)', p_refund_status using errcode = 'P0001';
++  end if;
++  update public.checkout_attempts set
++    refund_id = p_refund_id, refund_amount_cents = p_refund_amount_cents, refund_status = p_refund_status,
++    rejection_reason = p_reason, rejected_at = coalesce(rejected_at, now())
++  where id = p_id and lease_token = p_token and lease_expires_at > now()
++    and paid_at is not null and completed_at is null
++    and p_refund_amount_cents = paid_amount_cents
++    and (refund_id is null or refund_id = p_refund_id);
++  if not found then raise exception 'Remboursement incomplet, incohérent ou verrou perdu' using errcode = 'P0001'; end if;
++end $$;
++
++-- Suivi d'un remboursement (événements refund.updated / refund.failed)
++create function public.checkout_attempt_refund_status(p_refund_id text, p_status text)
++returns boolean language plpgsql security definer set search_path = '' as $$
++begin
++  update public.checkout_attempts set refund_status = p_status
++   where refund_id = p_refund_id
++     and not (refund_status = 'succeeded' and p_status = 'pending');  -- jamais revenir en arrière
++  return found;
++end $$;
++
++-- -----------------------------------------------------------------------------
++-- État de l'abonnement, relu chez Stripe à chaque événement
++--
++-- L'événement ne sert que de signal : le service relit l'abonnement chez Stripe
++-- et transmet son état actuel avec l'heure de cette lecture. L'ordre d'arrivée
++-- des événements ne compte donc plus; seule une lecture plus ancienne que la
++-- dernière appliquée est ignorée (deux traitements en parallèle).
++-- -----------------------------------------------------------------------------
++alter table public.subscriptions add column stripe_state_read_at timestamptz;
++
++create function public.apply_stripe_subscription_state(
++  p_event_id text, p_type text, p_subscription_id text, p_status text, p_read_at timestamptz
++) returns boolean language plpgsql security definer set search_path = '' as $$
++declare
++  s public.subscriptions%rowtype;
++begin
++  if p_status is null or p_read_at is null then
++    raise exception 'État Stripe incomplet' using errcode = '22023';
++  end if;
++  if not public.record_stripe_event(p_event_id, p_type) then return false; end if;
++
++  select * into s from public.subscriptions where stripe_subscription_id = p_subscription_id for update;
++  if not found then
++    -- Événement arrivé avant la création du dossier : erreur pour que Stripe le renvoie.
++    -- Toute la transaction est annulée : l'événement n'est pas marqué reçu.
++    raise exception 'Abonnement Stripe pas encore associé : %', p_subscription_id using errcode = 'P0001';
++  end if;
++
++  if s.stripe_state_read_at is null or p_read_at > s.stripe_state_read_at then
++    update public.subscriptions set
++      stripe_status        = p_status,
++      stripe_state_read_at = p_read_at,
++      -- En retard ou impayé : début du délai de grâce (une seule fois). Sinon : terminé.
++      payment_failed_at    = case when p_status in ('past_due', 'unpaid', 'incomplete')
++                                  then coalesce(payment_failed_at, p_read_at) end,
++      read_only_since      = case when p_status in ('past_due', 'unpaid', 'incomplete')
++                                  then read_only_since end
++    where id = s.id;
++  end if;
++
++  update public.stripe_events set processed_at = now() where id = p_event_id;
++  return true;
++end $$;
++
++-- -----------------------------------------------------------------------------
++-- Vue d'administration : les inscriptions, classées
++-- -----------------------------------------------------------------------------
++create view public.admin_checkout_attempts with (security_invoker = true) as
++select
++  a.id,
++  a.created_at,
++  a.display_name,
++  a.email,
++  a.phone,
++  a.granted_quote #>> '{terms,planCode}'                 as plan_code,
++  a.granted_quote #>> '{terms,billingOption}'            as billing_option,
++  (a.granted_quote #>> '{dueToday,totalCents}')::integer as due_today_cents,
++  a.paid_amount_cents,
++  a.paid_at,
++  a.completed_at,
++  a.rejected_at,
++  a.rejection_reason,
++  a.refund_amount_cents,
++  a.refund_status,
++  a.abandoned_at,
++  case
++    when a.refund_status = 'failed'
++      or (a.paid_at is not null and a.completed_at is null and a.rejected_at is null
++          and a.paid_at < now() - interval '15 minutes')        then 'to_handle'
++    when a.rejected_at is not null                             then 'refused'
++    when a.completed_at is not null                            then 'completed'
++    when a.abandoned_at is not null
++      or (a.paid_at is null and a.created_at < now() - interval '24 hours') then 'abandoned'
++    else 'in_progress'
++  end as category
++from public.checkout_attempts a
++where a.anonymized_at is null or a.refund_status = 'failed';
++comment on view public.admin_checkout_attempts is
++  'Inscriptions pour l''administration. to_handle : payé sans dossier depuis 15 min, ou remboursement en échec (urgent : le client a payé).';
++revoke all on public.admin_checkout_attempts from public, anon;
++grant select on public.admin_checkout_attempts to authenticated;
++
++-- -----------------------------------------------------------------------------
++-- Purge (Loi 25), appelée chaque jour par scheduled-jobs
++--   jamais payées : supprimées après p_unpaid_days;
++--   terminées : supprimées après p_done_days (le dossier client garde l'essentiel);
++--   refusées : coordonnées effacées après p_done_days, montants et remboursement gardés.
++-- Rien n'est purgé tant que le paiement attend un dossier ou qu'un remboursement a échoué.
++-- -----------------------------------------------------------------------------
++create function public.purge_checkout_attempts(p_unpaid_days integer default 30, p_done_days integer default 90)
++returns table (deleted_unpaid integer, deleted_completed integer, anonymized_refused integer)
++language plpgsql security definer set search_path = '' as $$
++declare
++  v_unpaid integer; v_done integer; v_refused integer;
++begin
++  if p_unpaid_days < 1 or p_done_days < 1 then
++    raise exception 'Durées de conservation invalides' using errcode = '22023';
++  end if;
++
++  delete from public.checkout_attempts
++   where paid_at is null and created_at < now() - make_interval(days => p_unpaid_days);
++  get diagnostics v_unpaid = row_count;
++
++  delete from public.checkout_attempts
++   where completed_at is not null and completed_at < now() - make_interval(days => p_done_days);
++  get diagnostics v_done = row_count;
++
++  update public.checkout_attempts set
++    email = 'efface+' || id::text || '@invalid',
++    phone = '-',
++    display_name = 'Effacé',
++    anonymized_at = now()
++  where rejected_at is not null and anonymized_at is null
++    and refund_status = 'succeeded'
++    and rejected_at < now() - make_interval(days => p_done_days);
++  get diagnostics v_refused = row_count;
++
++  return query select v_unpaid, v_done, v_refused;
++end $$;
++
++-- -----------------------------------------------------------------------------
++-- Privilèges : rôle service seulement
++-- -----------------------------------------------------------------------------
++revoke execute on function
++  private.is_valid_checkout_quote(jsonb),
++  public.checkout_attempt_create(uuid, text, text, text, boolean, boolean, integer, jsonb),
++  public.checkout_attempt_open_for(text),
++  public.checkout_attempt_abandon(uuid),
++  public.checkout_attempt_save_session(uuid, text),
++  public.checkout_attempt_claim(uuid, uuid),
++  public.checkout_attempt_release(uuid, uuid),
++  public.checkout_attempt_paid(uuid, uuid, text, text, text, text, integer),
++  public.checkout_attempt_subscription(uuid, uuid, text, text, text),
++  public.checkout_attempt_finish(uuid, uuid, text, timestamptz),
++  public.checkout_attempt_reject(uuid, uuid, text, integer, text, text),
++  public.checkout_attempt_refund_status(text, text),
++  public.apply_stripe_subscription_state(text, text, text, text, timestamptz),
++  public.purge_checkout_attempts(integer, integer)
++from public, anon, authenticated;
++
++grant execute on function
++  public.checkout_attempt_create(uuid, text, text, text, boolean, boolean, integer, jsonb),
++  public.checkout_attempt_open_for(text),
++  public.checkout_attempt_abandon(uuid),
++  public.checkout_attempt_save_session(uuid, text),
++  public.checkout_attempt_claim(uuid, uuid),
++  public.checkout_attempt_release(uuid, uuid),
++  public.checkout_attempt_paid(uuid, uuid, text, text, text, text, integer),
++  public.checkout_attempt_subscription(uuid, uuid, text, text, text),
++  public.checkout_attempt_finish(uuid, uuid, text, timestamptz),
++  public.checkout_attempt_reject(uuid, uuid, text, integer, text, text),
++  public.checkout_attempt_refund_status(text, text),
++  public.apply_stripe_subscription_state(text, text, text, text, timestamptz),
++  public.purge_checkout_attempts(integer, integer)
++to service_role;
+diff --git a/supabase/tests/rls/checkout_attempts.test.sql b/supabase/tests/rls/checkout_attempts.test.sql
+new file mode 100644
+index 0000000..afb6b38
+--- /dev/null
++++ b/supabase/tests/rls/checkout_attempts.test.sql
+@@ -0,0 +1,150 @@
++-- Tentatives d'inscription : validation, parcours, refus, inscriptions simultanées,
++-- état d'abonnement, vue d'administration, purge et privilèges.
++-- Les récapitulatifs sont la sortie réelle de quoteCheckout() (20 octobre 2026);
++-- un test Deno vérifie qu'ils suivent toujours domain/pricing.
++begin;
++create extension if not exists pgtap with schema extensions;
++set local search_path = public, extensions;
++grant execute on all functions in schema extensions to anon, authenticated;
++
++select plan(47);
++
++create temp table q (k text primary key, v jsonb) on commit drop;
++grant select on q to authenticated;
++insert into q values
++  ('elan',   '{"terms":{"gridVersion":"2026-10","planCode":"elan","billingOption":"monthly_commitment","cycle":"month","recurringPriceCents":14900,"includedTransactions":50,"extraTransactionCents":450,"includedAccounts":3,"extraAccountCents":1500,"includedFilingFrequency":"quarterly","extraFilingCents":2500,"quickbooksIncluded":false,"openingFeeCents":7500,"openingDiscountCents":7400,"stripeRecurringLookupKey":"elan_monthly_2026_10"},"startsOn":"2026-10-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":7500},{"kind":"first_period","amountCents":14900}],"totalCents":22400},"recurring":{"amountCents":14900,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":"2027-10-01","extraTransactionCents":450,"currentMonthBooksUpdate":null,"taxesIncluded":false}'),
++  ('trajet', '{"terms":{"gridVersion":"2026-10","planCode":"trajet","billingOption":"monthly","cycle":"month","recurringPriceCents":4900,"includedTransactions":15,"extraTransactionCents":450,"includedAccounts":1,"extraAccountCents":1500,"includedFilingFrequency":"annual","extraFilingCents":2500,"quickbooksIncluded":true,"openingFeeCents":4900,"openingDiscountCents":0,"stripeRecurringLookupKey":"trajet_monthly_2026_10"},"startsOn":"2026-11-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":4900}],"totalCents":4900},"recurring":{"amountCents":4900,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":null,"extraTransactionCents":450,"currentMonthBooksUpdate":{"fromCents":12000,"month":"2026-10-01"},"taxesIncluded":false}');
++-- 1. Récapitulatif complet et cohérent, vérifié avant le paiement
++select ok(private.is_valid_checkout_quote((select v from q where k = 'elan')), 'Récapitulatif du domaine : valide');
++select ok(private.is_valid_checkout_quote((select v from q where k = 'trajet')), 'Trajet, mois suivant : valide');
++select ok(not private.is_valid_checkout_quote((select v #- '{terms,includedAccounts}' from q where k = 'elan')), 'Clé absente : invalide, jamais « inconnu »');
++select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{dueToday,totalCents}', '22500') from q where k = 'elan')), 'Total différent de la somme des lignes : invalide');
++select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{recurring,amountCents}', '7900') from q where k = 'elan')), 'Montant récurrent différent du prix accordé : invalide');
++select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{terms,stripeRecurringLookupKey}', '"depart_monthly_2026_10"') from q where k = 'elan')), 'Clé Stripe d''un autre forfait : invalide');
++select ok(not private.is_valid_checkout_quote((select jsonb_set(jsonb_set(v, '{terms,billingOption}', '"annual"'), '{terms,cycle}', '"year"') from q where k = 'trajet')), 'Trajet à l''année : invalide');
++select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{recurring,nextChargeOn}', '"2026-12-01"') from q where k = 'elan')), 'Prochain prélèvement incohérent : invalide');
++select throws_ok($$ select public.checkout_attempt_create('a0000000-0000-4000-8000-000000000001', 'x@exemple.ca', '514', 'X',
++  true, false, 10, (select jsonb_set(v, '{dueToday,totalCents}', '1') from q where k = 'elan')) $$,
++  '22023', null, 'Récapitulatif incohérent : refusé avant le paiement');
++-- 2. Parcours complet : Élan avec engagement, mois en cours
++select lives_ok($$ select public.checkout_attempt_create('a1111111-1111-4111-8111-111111111111', 'Elise@Exemple.ca',
++  '514 555 0101', 'Élise Conseil', true, false, 40, (select v from q where k = 'elan')) $$, 'Tentative enregistrée');
++select is((select email from public.checkout_attempts where id = 'a1111111-1111-4111-8111-111111111111'), 'elise@exemple.ca', 'Courriel en minuscules');
++select throws_ok($$ select public.checkout_attempt_create('a9999999-9999-4999-8999-999999999999', 'elise@exemple.ca',
++  '514 555 0101', 'Élise', true, false, 40, (select v from q where k = 'elan')) $$,
++  'P0005', null, 'Deuxième inscription simultanée : refusée');
++select is(public.checkout_attempt_open_for('ELISE@exemple.ca'), 'a1111111-1111-4111-8111-111111111111'::uuid, 'La tentative ouverte est retrouvée pour être reprise');
++select public.checkout_attempt_save_session('a1111111-1111-4111-8111-111111111111', 'cs_test_elise');
++select ok(public.checkout_attempt_claim('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111'), 'Verrou acquis');
++select ok(not public.checkout_attempt_claim('a1111111-1111-4111-8111-111111111111', 'b2222222-2222-4222-8222-222222222222'), 'Un deuxième webhook attend son tour');
++select throws_ok($$ select public.checkout_attempt_paid('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'cs_autre', 'cus_elise', 'pi_elise', 'pm_elise', 22400) $$,
++  'P0001', null, 'Paiement d''une autre session : refusé');
++select public.checkout_attempt_paid('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'cs_test_elise', 'cus_elise', 'pi_elise', 'pm_elise', 22400);
++select throws_ok($$ select public.checkout_attempt_abandon('a1111111-1111-4111-8111-111111111111') $$, 'P0001', null, 'Une tentative payée ne peut pas être abandonnée');
++select public.checkout_attempt_subscription('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'sub_elise', 'price_elan_monthly', 'active');
++select isnt(public.checkout_attempt_finish('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'evt_elise', now() + interval '7 days'), null::uuid, 'Dossier créé');
++select is((select pp.plan_code || '/' || pp.recurring_price_cents || '/' || pp.included_accounts || '/' ||
++                  pp.included_filing_frequency || '/' || pp.quickbooks_included || '/' || pp.grid_version || '/' ||
++                  s.opening_fee_cents || '/' || s.opening_discount_cents
++           from public.subscription_plan_periods pp join public.subscriptions s on s.id = pp.subscription_id
++           where s.stripe_subscription_id = 'sub_elise'),
++  'elan/14900/3/quarterly/false/2026-10/7500/7400', 'Toutes les conditions accordées sont enregistrées');
++select is(public.checkout_attempt_finish('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'evt_elise_bis', now() + interval '7 days'),
++  (select m.client_id from public.mandates m join public.subscriptions s on s.mandate_id = m.id where s.stripe_subscription_id = 'sub_elise'),
++  'Webhook rejoué : même dossier, aucun doublon');
++select is((select count(*) from public.mandates m join public.clients c on c.id = m.client_id where c.contact_email = 'elise@exemple.ca'), 1::bigint, 'Un seul mandat');
++select public.checkout_attempt_release('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111');
++select throws_ok($$ select public.checkout_attempt_create('a8888888-8888-4888-8888-888888888888', 'elise@exemple.ca',
++  '514 555 0101', 'Élise', true, false, 40, (select v from q where k = 'elan')) $$,
++  'P0004', null, 'Dossier ouvert : nouvelle inscription refusée avant paiement');
++-- 3. Ancien client : pas de réouverture par le site
++select public.close_mandate((select m.id from public.mandates m join public.clients c on c.id = m.client_id
++  where c.contact_email = 'elise@exemple.ca'), 'temporary', 'client_request', (current_date + interval '6 years')::date);
++select throws_ok($$ select public.checkout_attempt_create('a7777777-7777-4777-8777-777777777777', 'elise@exemple.ca',
++  '514 555 0101', 'Élise', true, false, 40, (select v from q where k = 'elan')) $$,
++  'P0006', null, 'Ancien client : réouverture par l''application, jamais sur la foi d''un courriel');
++-- 4. Paiement sans dossier retrouvé : jamais « terminée »
++select public.checkout_attempt_create('a5555555-5555-4555-8555-555555555555', 'eve@exemple.ca', '514 555 0105', 'Ève', true, false, 30, (select v from q where k = 'elan'));
++select public.checkout_attempt_save_session('a5555555-5555-4555-8555-555555555555', 'cs_test_eve');
++select public.checkout_attempt_claim('a5555555-5555-4555-8555-555555555555', 'e1111111-1111-4111-8111-111111111111');
++select public.checkout_attempt_paid('a5555555-5555-4555-8555-555555555555', 'e1111111-1111-4111-8111-111111111111', 'cs_test_eve', 'cus_eve', 'pi_eve', 'pm_eve', 22400);
++select public.checkout_attempt_subscription('a5555555-5555-4555-8555-555555555555', 'e1111111-1111-4111-8111-111111111111', 'sub_eve', 'price_elan_monthly', 'active');
++select public.record_stripe_event('evt_deja_vu', 'checkout.session.completed');
++select throws_ok($$ select public.checkout_attempt_finish('a5555555-5555-4555-8555-555555555555', 'e1111111-1111-4111-8111-111111111111', 'evt_deja_vu', now() + interval '7 days') $$,
++  'P0001', null, 'Événement déjà traité mais aucun dossier : erreur, pas de fausse réussite');
++select is((select completed_at from public.checkout_attempts where id = 'a5555555-5555-4555-8555-555555555555'), null, 'La tentative reste « payée sans dossier »');
++-- 5. Refus après paiement : seulement avec le remboursement complet
++select public.checkout_attempt_create('a2222222-2222-4222-8222-222222222222', 'tom@exemple.ca', '438 555 0102', 'Tom Livraison', true, false, 12, (select v from q where k = 'trajet'));
++select public.checkout_attempt_save_session('a2222222-2222-4222-8222-222222222222', 'cs_test_tom');
++select public.checkout_attempt_claim('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111');
++select public.checkout_attempt_paid('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'cs_test_tom', 'cus_tom', 'pi_tom', 'pm_tom', 4900);
++select throws_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 2000, 'succeeded', 'inscription_refused') $$,
++  'P0001', null, 'Remboursement partiel : refus non enregistré');
++select throws_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 4900, 'failed', 'inscription_refused') $$,
++  'P0001', null, 'Remboursement refusé par Stripe : refus non enregistré');
++select lives_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 4900, 'pending', 'inscription_refused') $$,
++  'Remboursement complet en cours : refus enregistré');
++select throws_ok($$ select public.checkout_attempt_finish('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'evt_tom', now() + interval '7 days') $$,
++  'P0001', null, 'Tentative refusée : jamais de dossier');
++select public.checkout_attempt_refund_status('re_tom', 'failed');
++-- 6. Abandon : session expirée, puis paiement tardif remboursé
++select public.checkout_attempt_create('a3333333-3333-4333-8333-333333333333', 'ana@exemple.ca', '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet'));
++select public.checkout_attempt_save_session('a3333333-3333-4333-8333-333333333333', 'cs_test_ana');
++select lives_ok($$ select public.checkout_attempt_abandon('a3333333-3333-4333-8333-333333333333') $$, 'Tentative jamais payée : abandonnée');
++select lives_ok($$ select public.checkout_attempt_create('a4444444-4444-4444-8444-444444444444', 'ana@exemple.ca', '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet')) $$,
++  'Après l''abandon, une nouvelle inscription est possible');
++select public.checkout_attempt_claim('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111');
++select public.checkout_attempt_paid('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 'cs_test_ana', 'cus_ana', 'pi_ana', 'pm_ana', 4900);
++select throws_ok($$ select public.checkout_attempt_subscription('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 'sub_ana', 'price_trajet', 'active') $$,
++  'P0001', null, 'Payée après l''abandon : jamais d''abonnement');
++select lives_ok($$ select public.checkout_attempt_reject('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 're_ana', 4900, 'succeeded', 'paid_after_abandon') $$,
++  'Payée après l''abandon : remboursée');
++update public.checkout_attempts set created_at = now() - interval '25 hours' where id = 'a4444444-4444-4444-8444-444444444444';
++select lives_ok($$ select public.checkout_attempt_create('a6666666-6666-4666-8666-666666666666', 'ana@exemple.ca',
++  '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet')) $$,
++  'Tentative non payée de plus de 24 h : abandonnée automatiquement');
++-- 7. État de l'abonnement relu chez Stripe
++select throws_ok($$ select public.apply_stripe_subscription_state('evt_inconnu', 'invoice.paid', 'sub_absent', 'active', now()) $$,
++  'P0001', null, 'Abonnement pas encore associé : erreur pour que Stripe renvoie l''événement');
++select is((select count(*) from public.stripe_events where id = 'evt_inconnu'), 0::bigint, 'L''événement en erreur n''est pas marqué reçu');
++select public.apply_stripe_subscription_state('evt_s1', 'invoice.payment_failed', 'sub_elise', 'past_due', '2026-11-02 10:00+00');
++select is((select payment_failed_at from public.subscriptions where stripe_subscription_id = 'sub_elise'), '2026-11-02 10:00+00'::timestamptz, 'En retard : début du délai de grâce');
++select public.apply_stripe_subscription_state('evt_s2', 'invoice.paid', 'sub_elise', 'active', '2026-11-03 10:00+00');
++select public.apply_stripe_subscription_state('evt_s3', 'customer.subscription.updated', 'sub_elise', 'past_due', '2026-11-02 12:00+00');
++select is((select stripe_status || '/' || coalesce(payment_failed_at::text, 'aucun') from public.subscriptions where stripe_subscription_id = 'sub_elise'), 'active/aucun', 'Une lecture plus ancienne arrivée en retard est ignorée');
++select ok(not public.apply_stripe_subscription_state('evt_s2', 'invoice.paid', 'sub_elise', 'active', now()), 'Même événement reçu deux fois : ignoré');
++-- 8. Vue d'administration
++insert into auth.users (id, email) values ('00000000-0000-0000-0000-0000000000ad', 'admin@firme.ca');
++insert into public.admins (user_id) values ('00000000-0000-0000-0000-0000000000ad');
++insert into auth.users (id, email) values ('00000000-0000-0000-0000-00000000000c', 'client@exemple.ca');
++update public.checkout_attempts set paid_at = now() - interval '1 hour' where id = 'a5555555-5555-4555-8555-555555555555';
++set local role authenticated;
++select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-0000000000ad","aal":"aal2"}', true);
++select is((select string_agg(category, ',' order by created_at, id) from public.admin_checkout_attempts
++  where id in ('a1111111-1111-4111-8111-111111111111', 'a2222222-2222-4222-8222-222222222222', 'a3333333-3333-4333-8333-333333333333', 'a5555555-5555-4555-8555-555555555555')),
++  (select string_agg(c, ',' order by created_at, id) from (values
++     ((select created_at from public.checkout_attempts where id = 'a1111111-1111-4111-8111-111111111111'), 'a1111111-1111-4111-8111-111111111111'::uuid, 'completed'),
++     ((select created_at from public.checkout_attempts where id = 'a5555555-5555-4555-8555-555555555555'), 'a5555555-5555-4555-8555-555555555555'::uuid, 'to_handle'),
++     ((select created_at from public.checkout_attempts where id = 'a2222222-2222-4222-8222-222222222222'), 'a2222222-2222-4222-8222-222222222222'::uuid, 'to_handle'),
++     ((select created_at from public.checkout_attempts where id = 'a3333333-3333-4333-8333-333333333333'), 'a3333333-3333-4333-8333-333333333333'::uuid, 'refused')) v(created_at, id, c)),
++  'Administratrice : terminée, payée sans dossier et remboursement en échec « à traiter », refusée');
++select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-0000000000ad","aal":"aal1"}', true);
++select is((select count(*) from public.admin_checkout_attempts), 0::bigint, 'Sans double authentification : rien');
++select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-00000000000c","aal":"aal2"}', true);
++select is((select count(*) from public.checkout_attempts), 0::bigint, 'Un client connecté ne voit aucune tentative');
++select throws_ok($$ select public.checkout_attempt_claim('a1111111-1111-4111-8111-111111111111', gen_random_uuid()) $$, '42501', null, 'Un client connecté ne peut rien modifier');
++reset role;
++-- 9. Purge (Loi 25)
++update public.checkout_attempts set created_at = now() - interval '31 days' where paid_at is null;
++update public.checkout_attempts set completed_at = now() - interval '91 days' where id = 'a1111111-1111-4111-8111-111111111111';
++update public.checkout_attempts set rejected_at = now() - interval '91 days' where id in ('a2222222-2222-4222-8222-222222222222', 'a3333333-3333-4333-8333-333333333333');
++select is((select deleted_unpaid || '/' || deleted_completed || '/' || anonymized_refused from public.purge_checkout_attempts()),
++  '2/1/1', 'Purge : non payées et terminées supprimées, refusée remboursée anonymisée');
++select is((select email || '/' || refund_amount_cents from public.checkout_attempts where id = 'a3333333-3333-4333-8333-333333333333'),
++  'efface+a3333333-3333-4333-8333-333333333333@invalid/4900', 'Refusée : coordonnées effacées, montant remboursé gardé');
++select is((select email from public.checkout_attempts where id = 'a2222222-2222-4222-8222-222222222222'), 'tom@exemple.ca',
++  'Remboursement en échec : rien n''est effacé tant que ce n''est pas réglé');
++select isnt((select id from public.checkout_attempts where id = 'a5555555-5555-4555-8555-555555555555'), null, 'Payée sans dossier : jamais purgée');
++
++select * from finish();
++rollback;

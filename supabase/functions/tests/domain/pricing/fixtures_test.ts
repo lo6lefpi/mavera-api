@@ -1,5 +1,5 @@
 import { assertEquals } from "./assert.ts";
-import { grantTerms } from "../../../_shared/domain/pricing/mod.ts";
+import { grantTerms, quoteCheckout } from "../../../_shared/domain/pricing/mod.ts";
 
 /**
  * Garde-fou en attendant le test d'intégration de stripe-webhook : les
@@ -41,4 +41,31 @@ Deno.test("tests SQL : les conditions de handle_checkout_completed suivent grant
     }
   }
   assertEquals(found >= 9, true, `seulement ${found} appels trouvés : le format des tests SQL a changé ?`);
+});
+
+/**
+ * Même garde-fou pour les récapitulatifs enregistrés dans checkout_attempts :
+ * chaque JSON de checkout_attempts.test.sql doit être exactement la sortie de
+ * quoteCheckout() du 20 octobre 2026 pour le même choix.
+ */
+const QUOTE = /\('(\w+)',\s*'(\{"terms".*?\})'\)/g;
+const QUOTE_DAY = "2026-10-20";
+const DRIVER = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false, monthlyTransactions: 12 };
+
+Deno.test("tests SQL : les récapitulatifs de checkout_attempts suivent quoteCheckout()", async () => {
+  const sql = await Deno.readTextFile(new URL("../../../../tests/rls/checkout_attempts.test.sql", import.meta.url));
+  let found = 0;
+  for (const m of sql.matchAll(QUOTE)) {
+    found++;
+    const stored = JSON.parse(m[2]);
+    const expected = quoteCheckout({
+      planCode: stored.terms.planCode,
+      billingOption: stored.terms.billingOption,
+      startMonth: stored.startsOn === "2026-10-01" ? "current" : "next",
+      today: QUOTE_DAY,
+      trajetProfile: DRIVER,
+    });
+    assertEquals(stored, JSON.parse(JSON.stringify(expected)), m[1]);
+  }
+  assertEquals(found >= 2, true, `seulement ${found} récapitulatifs trouvés`);
 });

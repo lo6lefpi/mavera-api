@@ -4,6 +4,9 @@ import {
   BillingTerminalError,
   type BillingGateway,
   type PaymentProof,
+  type RefundResult,
+  type RefundStatus,
+  type SessionExpiry,
   type StripeSubscriptionRecord,
 } from '../../services/ports.ts';
 import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
@@ -13,7 +16,17 @@ export class FakeStripeGateway implements BillingGateway {
   subscriptions = new Map<string, StripeSubscriptionRecord & {
     attemptId: string; customerId: string; anchorOn: string; immediateInvoiceCents: number;
   }>();
-  refunds = new Map<string, string>();
+  /** Remboursements par tentative (le dernier accepté ou non). */
+  refunds = new Map<string, RefundResult>();
+  refundCreates = 0;
+  /** Statut des prochains remboursements créés. */
+  nextRefundStatus: RefundStatus = 'succeeded';
+  /** Montant remboursé imposé (simule un remboursement partiel); par défaut le montant demandé. */
+  nextRefundAmountCents: number | null = null;
+  /** État des sessions chez Stripe : une session « complete » ne peut plus être expirée. */
+  sessionStatus = new Map<string, 'open' | 'complete' | 'expired'>();
+  /** Statut d'abonnement relu chez Stripe (getSubscriptionStatus). */
+  subscriptionStatus = new Map<string, string>();
   canceled = new Set<string>();
   subscriptionCreates = 0;
   checkoutCreates = 0;
@@ -36,19 +49,30 @@ export class FakeStripeGateway implements BillingGateway {
     if (!this.sessions.has(id)) {
       this.sessions.set(id, {
         sessionId: id, attemptId: input.attemptId,
-        customerId: input.existingCustomerId ?? `cus_${++this.seq}`,
+        customerId: `cus_${++this.seq}`,
         paymentIntentId: `pi_${input.attemptId}`, paymentMethodId: `pm_${input.attemptId}`,
         amountPaidCents: input.lines.reduce((sum, line) => sum + line.amountCents, 0),
         currency: 'cad', paid: this.nextPaid,
         paidAt: this.nextPaid ? (this.paidAt ?? new Date(this.now() * 1000).toISOString()) : null,
       });
     }
+    if (!this.sessionStatus.has(id)) this.sessionStatus.set(id, 'open');
     return { sessionId: id, url: `https://checkout.stripe.test/${id}` };
   }
 
   async getCheckoutSession(sessionId: string) {
     if (!this.sessions.has(sessionId)) throw new Error('Session absente');
-    return { sessionId, url: `https://checkout.stripe.test/${sessionId}` };
+    const open = this.sessionStatus.get(sessionId) === 'open';
+    return { sessionId, url: open ? `https://checkout.stripe.test/${sessionId}` : null };
+  }
+
+  async expireCheckoutSession(sessionId: string): Promise<SessionExpiry> {
+    const status = this.sessionStatus.get(sessionId);
+    if (!status) throw new Error('Session absente');
+    if (status === 'complete') return 'completed';
+    if (status === 'expired') return 'already_expired';
+    this.sessionStatus.set(sessionId, 'expired');
+    return 'expired';
   }
 
   async getPaymentProof(sessionId: string) {
@@ -91,10 +115,22 @@ export class FakeStripeGateway implements BillingGateway {
 
   async refund(input: Parameters<BillingGateway['refund']>[0]) {
     const existing = this.refunds.get(input.attemptId);
-    if (existing) return existing;
-    const id = `re_${input.attemptId}`;
-    this.refunds.set(input.attemptId, id);
-    return id;
+    if (existing && existing.status !== 'failed' && existing.status !== 'canceled') return { ...existing };
+    this.refundCreates++;
+    const result: RefundResult = {
+      refundId: `re_${input.attemptId}_${this.refundCreates}`,
+      status: this.nextRefundStatus,
+      amountCents: this.nextRefundAmountCents ?? input.amountCents,
+    };
+    this.refunds.set(input.attemptId, result);
+    return { ...result };
+  }
+
+  async getSubscriptionStatus(subscriptionId: string) {
+    const readAt = new Date(this.now() * 1000).toISOString();
+    const status = this.subscriptionStatus.get(subscriptionId) ?? this.subscriptions.get(subscriptionId)?.status;
+    if (!status) throw new Error('Abonnement absent');
+    return { status, readAt };
   }
 
   async cancelSubscription(subscriptionId: string) {

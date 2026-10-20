@@ -19,11 +19,26 @@ export interface SignupInput {
   cancelUrl: string;
 }
 export type Eligibility = 'new' | 'returning' | 'review' | 'active' | 'refused';
+
 /** Erreur définitive Stripe : impossible d'honorer le devis encaissé. */
 export class BillingTerminalError extends Error {
   readonly reason: string;
   constructor(reason: string) { super(reason); this.name = 'BillingTerminalError'; this.reason = reason; }
 }
+
+/**
+ * Refus d'une inscription, avant tout paiement. public-api traduit le code en
+ * message pour le site.
+ * - returning_client : ancien client → réouverture par l'application, où il est authentifié
+ * - not_allowed : dossier déjà ouvert, ou client refusé définitivement
+ * - payment_in_progress : un paiement pour ce courriel est en cours de traitement
+ */
+export type SignupErrorCode = 'returning_client' | 'not_allowed' | 'payment_in_progress';
+export class SignupError extends Error {
+  readonly code: SignupErrorCode;
+  constructor(code: SignupErrorCode) { super(code); this.name = 'SignupError'; this.code = code; }
+}
+
 export interface PaymentProof {
   sessionId: string;
   attemptId: string;
@@ -37,6 +52,11 @@ export interface PaymentProof {
   paidAt: string | null;
 }
 export interface StripeSubscriptionRecord { subscriptionId: string; priceId: string; status: string }
+
+/** Statuts d'un remboursement Stripe. Seuls pending et succeeded permettent d'enregistrer un refus. */
+export type RefundStatus = 'pending' | 'succeeded' | 'failed' | 'canceled' | 'requires_action';
+export interface RefundResult { refundId: string; status: RefundStatus; amountCents: number }
+
 export interface CheckoutAttempt {
   id: string;
   createdAt: string;
@@ -53,19 +73,28 @@ export interface CheckoutAttempt {
   stripeSubscriptionId: string | null;
   stripePriceId: string | null;
   stripeStatus: string | null;
+  paidAmountCents: number | null;
   paidAt: string | null;
   completedAt: string | null;
   rejectedAt: string | null;
+  abandonedAt: string | null;
   refundId: string | null;
 }
-export interface BillingFact {
+
+/** Signal d'un événement d'abonnement : l'état réel est relu chez Stripe. */
+export interface SubscriptionSignal {
   eventId: string;
   type: 'invoice.paid' | 'invoice.payment_failed' |
     'customer.subscription.updated' | 'customer.subscription.deleted';
   subscriptionId: string;
-  status?: string;
-  occurredAt: string;
 }
+/** État d'abonnement lu chez Stripe, avec l'heure du début de la lecture. */
+export interface SubscriptionState extends SubscriptionSignal { status: string; readAt: string }
+export interface RefundSignal { refundId: string; status: RefundStatus }
+
+/** Ce que donne la tentative d'expirer une session de paiement chez Stripe. */
+export type SessionExpiry = 'expired' | 'already_expired' | 'completed';
+
 export interface BillingGateway {
   createCheckoutSession(input: {
     attemptId: string;
@@ -73,11 +102,12 @@ export interface BillingGateway {
     lines: ReadonlyArray<{ label: string; amountCents: number }>;
     successUrl: string;
     cancelUrl: string;
-    existingCustomerId?: string;
     /** Date du prochain prélèvement (quote.recurring.nextChargeOn) : la session expire avant. */
     payBefore: IsoDate;
   }): Promise<{ sessionId: string; url: string }>;
   getCheckoutSession(sessionId: string): Promise<{ sessionId: string; url: string | null }>;
+  /** Empêche une session de paiement d'être payée (remplacement par une nouvelle). */
+  expireCheckoutSession(sessionId: string): Promise<SessionExpiry>;
   getPaymentProof(sessionId: string): Promise<PaymentProof>;
   findSubscriptionForAttempt(customerId: string, attemptId: string): Promise<StripeSubscriptionRecord | null>;
   createSubscription(input: {
@@ -91,20 +121,27 @@ export interface BillingGateway {
     /** Heure du paiement : décide du traitement tardif (après l'ancrage). */
     paidAt: string;
   }): Promise<StripeSubscriptionRecord>;
-  refund(input: { attemptId: string; paymentIntentId: string; amountCents?: number; reason: string }): Promise<string>;
+  /** Rembourse exactement amountCents (le montant payé). Ne rembourse jamais deux fois. */
+  refund(input: { attemptId: string; paymentIntentId: string; amountCents: number; reason: string }): Promise<RefundResult>;
   cancelSubscription(subscriptionId: string, attemptId: string): Promise<void>;
+  getSubscriptionStatus(subscriptionId: string): Promise<{ status: string; readAt: string }>;
 }
+
 export interface CheckoutRepository {
   checkEligibility(email: string, phone: string, customerId?: string): Promise<Eligibility>;
-  existingCustomerId(email: string): Promise<string | null>;
   createAttempt(input: SignupInput, quote: CheckoutQuote): Promise<CheckoutAttempt>;
   getAttempt(attemptId: string): Promise<CheckoutAttempt | null>;
+  /** Tentative ouverte (ni terminée, ni refusée, ni abandonnée) pour un courriel. */
+  openAttemptFor(email: string): Promise<string | null>;
+  /** Abandonne une tentative jamais payée, après l'expiration de sa session chez Stripe. */
+  abandon(attemptId: string): Promise<void>;
   saveSession(attemptId: string, sessionId: string): Promise<void>;
   claim(attemptId: string, token: string): Promise<boolean>;
   savePayment(attemptId: string, token: string, proof: PaymentProof): Promise<void>;
   saveSubscription(attemptId: string, token: string, subscription: StripeSubscriptionRecord): Promise<void>;
   complete(attemptId: string, token: string, eventId: string, invitationExpiresAt: string): Promise<string | null>;
-  reject(attemptId: string, token: string, refundId: string, reason: string): Promise<void>;
+  reject(attemptId: string, token: string, refund: RefundResult, reason: string): Promise<void>;
   release(attemptId: string, token: string): Promise<void>;
-  recordFact(fact: BillingFact): Promise<boolean>;
+  applySubscriptionState(state: SubscriptionState): Promise<boolean>;
+  updateRefundStatus(signal: RefundSignal): Promise<boolean>;
 }

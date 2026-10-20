@@ -3,7 +3,14 @@
  * et les conditions viennent de domain/pricing, par la tentative enregistrée.
  * Chaque création chez Stripe a une clé d'idempotence liée à la tentative.
  */
-import { BillingTerminalError, type BillingGateway, type PaymentProof } from '../../services/ports.ts';
+import {
+  BillingTerminalError,
+  type BillingGateway,
+  type PaymentProof,
+  type RefundResult,
+  type RefundStatus,
+  type SessionExpiry,
+} from '../../services/ports.ts';
 import { stripeClient, type Stripe } from './client.ts';
 import { productIdOf, resolveRecurringPrice } from './prices.ts';
 import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
@@ -11,6 +18,10 @@ import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
 const idOf = (value: string | { id: string } | null | undefined): string =>
   typeof value === 'string' ? value : value?.id ?? '';
+const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'failed', 'canceled', 'requires_action']);
+/** Statut inconnu ou absent : traité comme non accepté (jamais comme réussi). */
+const refundStatusOf = (status: string | null): RefundStatus =>
+  status && REFUND_STATUSES.has(status) ? status as RefundStatus : 'requires_action';
 
 export class StripeGateway implements BillingGateway {
   private stripe = stripeClient();
@@ -23,9 +34,9 @@ export class StripeGateway implements BillingGateway {
       currency: 'cad',
       locale: 'fr-CA',
       expires_at: expiresAt,
-      ...(input.existingCustomerId
-        ? { customer: input.existingCustomerId }
-        : { customer_creation: 'always' as const, customer_email: input.email }),
+      // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
+      customer_creation: 'always',
+      customer_email: input.email,
       client_reference_id: input.attemptId,
       metadata: { attempt_id: input.attemptId },
       payment_intent_data: {
@@ -50,6 +61,26 @@ export class StripeGateway implements BillingGateway {
     const session = await this.stripe.checkout.sessions.retrieve(sessionId);
     // Une session expirée ou terminée n'a plus d'adresse utilisable.
     return { sessionId: session.id, url: session.status === 'open' ? session.url : null };
+  }
+
+  /**
+   * Empêche l'ancienne session d'être payée. Si l'expiration échoue (session
+   * payée entre-temps), l'état réel est relu : une session « complete »
+   * signifie qu'un paiement est en cours de traitement.
+   */
+  async expireCheckoutSession(sessionId: string): Promise<SessionExpiry> {
+    const before = await this.stripe.checkout.sessions.retrieve(sessionId);
+    if (before.status === 'complete') return 'completed';
+    if (before.status === 'expired') return 'already_expired';
+    try {
+      await this.stripe.checkout.sessions.expire(sessionId);
+      return 'expired';
+    } catch (error) {
+      const after = await this.stripe.checkout.sessions.retrieve(sessionId);
+      if (after.status === 'complete') return 'completed';
+      if (after.status === 'expired') return 'already_expired';
+      throw error;
+    }
   }
 
   /** Relu chez Stripe à chaque fois : le contenu de l'événement ne suffit pas. */
@@ -145,17 +176,35 @@ export class StripeGateway implements BillingGateway {
     return { subscriptionId: sub.id, priceId: price.id, status: sub.status };
   }
 
-  async refund(input: Parameters<BillingGateway['refund']>[0]) {
-    // Une reprise après 24 h ne doit jamais rembourser deux fois.
+  /**
+   * Rembourse exactement le montant payé. Une reprise réutilise le remboursement
+   * déjà accepté (jamais deux remboursements); après un remboursement échoué ou
+   * annulé, un nouveau est créé avec une nouvelle clé d'idempotence.
+   */
+  async refund(input: Parameters<BillingGateway['refund']>[0]): Promise<RefundResult> {
+    if (!Number.isSafeInteger(input.amountCents) || input.amountCents <= 0) {
+      throw new Error('Montant de remboursement invalide');
+    }
+    let failedBefore = 0;
     for await (const previous of this.stripe.refunds.list({ payment_intent: input.paymentIntentId, limit: 100 })) {
-      if (previous.metadata?.attempt_id === input.attemptId && previous.status !== 'failed') return previous.id;
+      if (previous.metadata?.attempt_id !== input.attemptId) continue;
+      const status = refundStatusOf(previous.status);
+      if (status === 'failed' || status === 'canceled') { failedBefore++; continue; }
+      return { refundId: previous.id, status, amountCents: previous.amount };
     }
     const refund = await this.stripe.refunds.create({
       payment_intent: input.paymentIntentId,
-      ...(input.amountCents === undefined ? {} : { amount: input.amountCents }),
+      amount: input.amountCents,
       metadata: { attempt_id: input.attemptId, reason: input.reason.slice(0, 300) },
-    }, { idempotencyKey: `refund:signup:${input.attemptId}` });
-    return refund.id;
+    }, { idempotencyKey: `refund:signup:${input.attemptId}:${failedBefore}` });
+    return { refundId: refund.id, status: refundStatusOf(refund.status), amountCents: refund.amount };
+  }
+
+  /** L'heure est prise avant la lecture : un état lu plus tôt ne remplace jamais un état plus récent. */
+  async getSubscriptionStatus(subscriptionId: string) {
+    const readAt = new Date().toISOString();
+    const sub = await this.stripe.subscriptions.retrieve(subscriptionId);
+    return { status: sub.status, readAt };
   }
 
   async cancelSubscription(subscriptionId: string, attemptId: string) {

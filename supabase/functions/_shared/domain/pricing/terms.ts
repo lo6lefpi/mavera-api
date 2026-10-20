@@ -52,11 +52,12 @@ export interface GrantedTerms {
   /** Rabais obtenu sur l'ouverture grâce à l'engagement (0 sans engagement). */
   readonly openingDiscountCents: Cents;
   /**
-   * Clés de recherche des prix Stripe (lookup_key). integrations/stripe les
-   * convertit en identifiants de prix, qui diffèrent entre test et production.
+   * Clé de recherche du prix récurrent Stripe (lookup_key). integrations/stripe
+   * la convertit en identifiant de prix, qui diffère entre test et production.
+   * Les frais d'ouverture n'ont pas de prix Stripe : ils sont facturés au
+   * montant accordé, dans la session de paiement.
    */
   readonly stripeRecurringLookupKey: string;
-  readonly stripeOpeningLookupKey: string;
 }
 
 export function getPlan(code: PlanCode | string): PlanPricing {
@@ -124,9 +125,6 @@ export function grantTerms(planCode: PlanCode | string, billing: BillingOption |
   assertBillingOffered(plan, billing);
   const option = billing as BillingOption;
   const cycle = cycleOf(option);
-  const openingKind = hasCommitment(option) && plan.openingFee.reducedCents !== null
-    ? "reduced"
-    : "full";
   return {
     gridVersion: GRID_VERSION,
     planCode: plan.code,
@@ -143,7 +141,6 @@ export function grantTerms(planCode: PlanCode | string, billing: BillingOption |
     openingFeeCents: openingFee(plan, option),
     openingDiscountCents: plan.openingFee.fullCents - openingFee(plan, option),
     stripeRecurringLookupKey: `${plan.code}_${cycle === "year" ? "annual" : "monthly"}_${lookupKeySuffix()}`,
-    stripeOpeningLookupKey: `opening_${plan.code}_${openingKind}_${lookupKeySuffix()}`,
   };
 }
 

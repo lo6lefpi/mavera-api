@@ -1,4 +1,4 @@
-import { BillingTerminalError, type BillingGateway, type CheckoutRepository, type CheckoutAttempt } from './ports.ts';
+import { BillingTerminalError, type BillingGateway, type CheckoutAttempt, type CheckoutRepository } from './ports.ts';
 
 const rejectedCode = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') return false;
@@ -8,19 +8,34 @@ const rejectedCode = (error: unknown): boolean => {
   return ['P0003', 'P0004'].includes(code) || ['P0003', 'P0004'].includes(sqlstate);
 };
 
+/**
+ * Rembourse le montant payé, puis enregistre le refus. Le refus n'est enregistré
+ * que si Stripe a accepté un remboursement complet (réussi ou en cours) : sinon
+ * erreur, le webhook échoue et sera rejoué, et la tentative apparaît « à traiter »
+ * dans l'administration (payée sans dossier).
+ */
 async function compensate(attempt: CheckoutAttempt, token: string, reason: string,
   deps: { billing: BillingGateway; repository: CheckoutRepository }): Promise<void> {
-  if (!attempt.stripePaymentIntentId) throw new Error('Remboursement impossible : PaymentIntent absent');
+  if (!attempt.stripePaymentIntentId || !attempt.paidAmountCents) {
+    throw new Error('Remboursement impossible : paiement non enregistré');
+  }
   if (attempt.stripeSubscriptionId) {
     await deps.billing.cancelSubscription(attempt.stripeSubscriptionId, attempt.id);
   }
-  const refundId = await deps.billing.refund({
-    attemptId: attempt.id, paymentIntentId: attempt.stripePaymentIntentId, reason,
+  const refund = await deps.billing.refund({
+    attemptId: attempt.id, paymentIntentId: attempt.stripePaymentIntentId,
+    amountCents: attempt.paidAmountCents, reason,
   });
-  await deps.repository.reject(attempt.id, token, refundId, reason);
+  if (refund.status !== 'pending' && refund.status !== 'succeeded') {
+    throw new Error(`Remboursement non accepté par Stripe (${refund.status}) : à traiter`);
+  }
+  if (refund.amountCents !== attempt.paidAmountCents) {
+    throw new Error('Remboursement incomplet : à traiter');
+  }
+  await deps.repository.reject(attempt.id, token, refund, reason);
 }
 
-/** Seul le webhook appelle cette fonction. La quote n'est jamais recalculée. */
+/** Seul le webhook appelle cette fonction. Le récapitulatif n'est jamais recalculé. */
 export async function completeCheckout(
   attemptId: string, eventId: string,
   deps: { billing: BillingGateway; repository: CheckoutRepository },
@@ -42,16 +57,26 @@ export async function completeCheckout(
     if (!proof.customerId || !proof.paymentIntentId || !proof.paymentMethodId || !proof.paidAt) {
       throw new Error('Moyen de paiement récurrent indisponible');
     }
-    if (proof.currency !== 'cad' || proof.amountPaidCents !== a.quote.dueToday.totalCents) {
-      throw new Error('Paiement reçu non conforme aux conditions accordées');
-    }
+
+    // Le paiement est toujours enregistré, même non conforme : il doit pouvoir être remboursé.
     await deps.repository.savePayment(attemptId, token, proof);
     a = (await deps.repository.getAttempt(attemptId))!;
+
+    if (proof.currency !== 'cad' || proof.amountPaidCents !== a.quote.dueToday.totalCents) {
+      await compensate(a, token, 'montant_non_conforme', deps);
+      return 'rejected';
+    }
+    // Payée après l'expiration de sa session (remplacée par une autre inscription) : remboursée.
+    if (a.abandonedAt) {
+      await compensate(a, token, 'paye_apres_abandon', deps);
+      return 'rejected';
+    }
     const eligibility = await deps.repository.checkEligibility(a.email, a.phone, proof.customerId);
-    if (eligibility === 'active' || eligibility === 'refused') {
+    if (eligibility === 'active' || eligibility === 'refused' || eligibility === 'returning') {
       await compensate(a, token, `inscription_${eligibility}`, deps);
       return 'rejected';
     }
+
     let sub = a.stripeSubscriptionId
       ? { subscriptionId: a.stripeSubscriptionId, priceId: a.stripePriceId!, status: a.stripeStatus! }
       : await deps.billing.findSubscriptionForAttempt(proof.customerId, attemptId);

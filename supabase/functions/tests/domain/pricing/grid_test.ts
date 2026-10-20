@@ -63,11 +63,9 @@ Deno.test("conditions accordées : instantané complet pour la base et Stripe", 
     openingFeeCents: 7500,
     openingDiscountCents: 7400,
     stripeRecurringLookupKey: "elan_annual_2026_10",
-    stripeOpeningLookupKey: "opening_elan_reduced_2026_10",
   });
   const monthly = grantTerms("depart", "monthly");
   assertEquals(monthly.stripeRecurringLookupKey, "depart_monthly_2026_10");
-  assertEquals(monthly.stripeOpeningLookupKey, "opening_depart_full_2026_10");
   // Le mensuel avec engagement utilise le même prix récurrent que le mensuel.
   assertEquals(grantTerms("depart", "monthly_commitment").stripeRecurringLookupKey, "depart_monthly_2026_10");
 });

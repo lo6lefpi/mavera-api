@@ -3,7 +3,7 @@
  * vérifiée avant tout; le contenu de l'événement sert seulement à savoir quoi
  * relire chez Stripe, jamais de preuve de paiement.
  */
-import type { BillingFact } from '../../services/ports.ts';
+import type { RefundSignal, RefundStatus, SubscriptionSignal } from '../../services/ports.ts';
 import { signatureVerifier, Stripe } from './client.ts';
 
 export async function verifyWebhook(body: string, signature: string | null): Promise<Stripe.Event> {
@@ -27,8 +27,12 @@ export function checkoutEvent(event: Stripe.Event): { attemptId: string } | null
   return attemptId ? { attemptId } : null;
 }
 
-export function billingFact(event: Stripe.Event): BillingFact | null {
-  const occurredAt = new Date(event.created * 1000).toISOString();
+/**
+ * Événement d'abonnement ou de facture → signal seulement : le statut n'est
+ * jamais lu dans l'événement (ordre d'arrivée non garanti), le service le relit
+ * chez Stripe.
+ */
+export function subscriptionSignal(event: Stripe.Event): SubscriptionSignal | null {
   if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
     const invoice = event.data.object as Stripe.Invoice;
     const details = invoice.parent?.subscription_details;
@@ -36,13 +40,24 @@ export function billingFact(event: Stripe.Event): BillingFact | null {
     const subscriptionId = typeof parent === 'string' ? parent : parent?.id;
     // Facture sans abonnement, ou abonnement qui ne vient pas d'une inscription : ignorée.
     if (!subscriptionId || !details?.metadata?.attempt_id) return null;
-    return { eventId: event.id, type: event.type, subscriptionId, occurredAt };
+    return { eventId: event.id, type: event.type, subscriptionId };
   }
   if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
     const sub = event.data.object as Stripe.Subscription;
     // Seuls les abonnements créés par une inscription portent attempt_id.
     if (!sub.metadata?.attempt_id) return null;
-    return { eventId: event.id, type: event.type, subscriptionId: sub.id, status: sub.status, occurredAt };
+    return { eventId: event.id, type: event.type, subscriptionId: sub.id };
   }
   return null;
+}
+
+const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'failed', 'canceled', 'requires_action']);
+
+/** Suivi d'un remboursement d'inscription (refund.updated, refund.failed). */
+export function refundSignal(event: Stripe.Event): RefundSignal | null {
+  if (event.type !== 'refund.updated' && event.type !== 'refund.failed') return null;
+  const refund = event.data.object as Stripe.Refund;
+  // Seuls les remboursements d'inscription portent attempt_id.
+  if (!refund.metadata?.attempt_id || !refund.status || !REFUND_STATUSES.has(refund.status)) return null;
+  return { refundId: refund.id, status: refund.status as RefundStatus };
 }

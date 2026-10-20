@@ -1,5 +1,5 @@
 import { quoteCheckout, type CheckoutQuote } from '../domain/pricing/mod.ts';
-import type { BillingGateway, CheckoutRepository, SignupInput } from './ports.ts';
+import { type BillingGateway, type CheckoutRepository, SignupError, type SignupInput } from './ports.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -52,7 +52,10 @@ export async function startCheckout(
     }
   } else {
     const eligibility = await deps.repository.checkEligibility(normalizedInput.email, input.phone);
-    if (eligibility === 'active' || eligibility === 'refused') throw new Error('Inscription non admissible');
+    // Ancien client : jamais de réouverture sur la foi d'un courriel tapé sur le site.
+    if (eligibility === 'returning') throw new SignupError('returning_client');
+    if (eligibility === 'active' || eligibility === 'refused') throw new SignupError('not_allowed');
+    await replaceOpenAttempt(normalizedInput.email, deps);
   }
   const quote = existing?.quote ?? prepareQuote(normalizedInput, today);
   const lines = quote.dueToday.lines.map(line => ({
@@ -63,13 +66,32 @@ export async function startCheckout(
       lines.reduce((sum, line) => sum + line.amountCents, 0) !== quote.dueToday.totalCents ||
       quote.dueToday.totalCents <= 0) throw new Error('Récapitulatif invalide');
   if (!existing) await deps.repository.createAttempt(normalizedInput, quote);
-  const customerId = await deps.repository.existingCustomerId(normalizedInput.email);
+  // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
   const result = await deps.billing.createCheckoutSession({
     attemptId: input.attemptId, email: normalizedInput.email, lines,
     successUrl: input.successUrl, cancelUrl: input.cancelUrl,
     payBefore: quote.recurring.nextChargeOn,
-    ...(customerId ? { existingCustomerId: customerId } : {}),
   });
   await deps.repository.saveSession(input.attemptId, result.sessionId);
   return { ...result, attemptId: input.attemptId, quote };
+}
+
+/**
+ * Une seule inscription ouverte par courriel. Une nouvelle demande remplace
+ * l'ancienne : sa session Stripe est d'abord expirée (elle ne pourra plus être
+ * payée), puis la tentative est abandonnée. Si l'ancienne a déjà été payée,
+ * on attend son traitement au lieu de faire payer une deuxième fois.
+ */
+async function replaceOpenAttempt(
+  email: string, deps: { billing: BillingGateway; repository: CheckoutRepository },
+): Promise<void> {
+  const openId = await deps.repository.openAttemptFor(email);
+  if (!openId) return;
+  const open = await deps.repository.getAttempt(openId);
+  if (!open || open.paidAt) throw new SignupError('payment_in_progress');
+  if (open.stripeSessionId) {
+    const outcome = await deps.billing.expireCheckoutSession(open.stripeSessionId);
+    if (outcome === 'completed') throw new SignupError('payment_in_progress');
+  }
+  await deps.repository.abandon(openId);
 }
