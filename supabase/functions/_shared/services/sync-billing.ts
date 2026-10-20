@@ -1,4 +1,4 @@
-import type { BillingGateway, CheckoutRepository, RefundSignal, SubscriptionSignal } from './ports.ts';
+import type { BillingGateway, CheckoutRepository, RefundSignal, RefundSync, SubscriptionSignal } from './ports.ts';
 
 /**
  * Événement d'abonnement ou de facture : l'événement n'est qu'un signal. L'état
@@ -14,7 +14,33 @@ export async function syncSubscription(
   return await deps.repository.applySubscriptionState({ ...signal, status, readAt });
 }
 
-/** Suivi d'un remboursement : un échec fait apparaître l'inscription « à traiter ». */
-export async function syncRefund(signal: RefundSignal, deps: { repository: CheckoutRepository }): Promise<boolean> {
-  return await deps.repository.updateRefundStatus(signal);
+/**
+ * Suivi d'un remboursement : le statut est relu chez Stripe (l'ordre des
+ * événements ne compte pas). Un remboursement accepté dont le refus n'est pas
+ * encore enregistré donne une erreur : Stripe renverra l'événement.
+ * Un échec fait apparaître l'inscription « à traiter ».
+ */
+export async function syncRefund(
+  signal: RefundSignal,
+  deps: { billing: BillingGateway; repository: CheckoutRepository },
+): Promise<RefundSync> {
+  const status = await deps.billing.getRefundStatus(signal.refundId);
+  const result = await deps.repository.updateRefundStatus({ ...signal, status });
+  if (result === 'not_recorded') throw new Error(`Remboursement ${signal.refundId} pas encore enregistré : réessayer`);
+  return result;
+}
+
+/**
+ * Session de paiement expirée chez Stripe (checkout.session.expired) : elle ne
+ * peut plus être payée, la tentative est abandonnée pour libérer le courriel.
+ * Une tentative déjà payée ou fermée n'est jamais touchée.
+ */
+export async function closeExpiredSession(
+  attemptId: string, deps: { repository: CheckoutRepository },
+): Promise<'abandoned' | 'unchanged' | 'unknown_attempt'> {
+  const attempt = await deps.repository.getAttempt(attemptId);
+  if (!attempt) return 'unknown_attempt';
+  if (attempt.paidAt || attempt.completedAt || attempt.rejectedAt || attempt.abandonedAt) return 'unchanged';
+  await deps.repository.abandon(attemptId);
+  return 'abandoned';
 }

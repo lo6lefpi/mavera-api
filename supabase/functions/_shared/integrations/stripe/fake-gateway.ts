@@ -126,6 +126,13 @@ export class FakeStripeGateway implements BillingGateway {
     return { ...result };
   }
 
+  /** Statut relu chez Stripe; un test peut le modifier dans refunds. */
+  async getRefundStatus(refundId: string): Promise<RefundStatus> {
+    const refund = [...this.refunds.values()].find(r => r.refundId === refundId);
+    if (!refund) throw new Error('Remboursement absent');
+    return refund.status;
+  }
+
   async getSubscriptionStatus(subscriptionId: string) {
     const readAt = new Date(this.now() * 1000).toISOString();
     const status = this.subscriptionStatus.get(subscriptionId) ?? this.subscriptions.get(subscriptionId)?.status;

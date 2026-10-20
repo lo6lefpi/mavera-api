@@ -200,6 +200,11 @@ export class StripeGateway implements BillingGateway {
     return { refundId: refund.id, status: refundStatusOf(refund.status), amountCents: refund.amount };
   }
 
+  async getRefundStatus(refundId: string): Promise<RefundStatus> {
+    const refund = await this.stripe.refunds.retrieve(refundId);
+    return refundStatusOf(refund.status);
+  }
+
   /** L'heure est prise avant la lecture : un état lu plus tôt ne remplace jamais un état plus récent. */
   async getSubscriptionStatus(subscriptionId: string) {
     const readAt = new Date().toISOString();

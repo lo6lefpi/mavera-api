@@ -32,11 +32,19 @@ export class BillingTerminalError extends Error {
  * - returning_client : ancien client → réouverture par l'application, où il est authentifié
  * - not_allowed : dossier déjà ouvert, ou client refusé définitivement
  * - payment_in_progress : un paiement pour ce courriel est en cours de traitement
+ * - attempt_expired : la tentative ne peut plus être payée; le site recommence avec un nouvel identifiant
+ * - attempt_conflict : même identifiant avec d'autres choix; le site recommence avec un nouvel identifiant
  */
-export type SignupErrorCode = 'returning_client' | 'not_allowed' | 'payment_in_progress';
+export type SignupErrorCode =
+  | 'returning_client' | 'not_allowed' | 'payment_in_progress' | 'attempt_expired' | 'attempt_conflict';
 export class SignupError extends Error {
   readonly code: SignupErrorCode;
   constructor(code: SignupErrorCode) { super(code); this.name = 'SignupError'; this.code = code; }
+}
+
+/** Demande mal formée (champ manquant ou invalide) : jamais une panne. */
+export class InvalidRequestError extends Error {
+  constructor(message: string) { super(message); this.name = 'InvalidRequestError'; }
 }
 
 export interface PaymentProof {
@@ -79,6 +87,8 @@ export interface CheckoutAttempt {
   rejectedAt: string | null;
   abandonedAt: string | null;
   refundId: string | null;
+  /** Empreinte des choix de la demande (SHA-256); null pour une tentative plus ancienne. */
+  requestFingerprint: string | null;
 }
 
 /** Signal d'un événement d'abonnement : l'état réel est relu chez Stripe. */
@@ -90,7 +100,11 @@ export interface SubscriptionSignal {
 }
 /** État d'abonnement lu chez Stripe, avec l'heure du début de la lecture. */
 export interface SubscriptionState extends SubscriptionSignal { status: string; readAt: string }
-export interface RefundSignal { refundId: string; status: RefundStatus }
+/** Signal d'un remboursement d'inscription : le statut est relu chez Stripe. */
+export interface RefundSignal { refundId: string; attemptId: string }
+export interface RefundState extends RefundSignal { status: RefundStatus }
+/** Résultat du suivi (voir checkout_attempt_refund_status). */
+export type RefundSync = 'updated' | 'not_recorded' | 'ignored' | 'unknown_attempt';
 
 /** Ce que donne la tentative d'expirer une session de paiement chez Stripe. */
 export type SessionExpiry = 'expired' | 'already_expired' | 'completed';
@@ -125,11 +139,12 @@ export interface BillingGateway {
   refund(input: { attemptId: string; paymentIntentId: string; amountCents: number; reason: string }): Promise<RefundResult>;
   cancelSubscription(subscriptionId: string, attemptId: string): Promise<void>;
   getSubscriptionStatus(subscriptionId: string): Promise<{ status: string; readAt: string }>;
+  getRefundStatus(refundId: string): Promise<RefundStatus>;
 }
 
 export interface CheckoutRepository {
   checkEligibility(email: string, phone: string, customerId?: string): Promise<Eligibility>;
-  createAttempt(input: SignupInput, quote: CheckoutQuote): Promise<CheckoutAttempt>;
+  createAttempt(input: SignupInput, quote: CheckoutQuote, requestFingerprint: string): Promise<CheckoutAttempt>;
   getAttempt(attemptId: string): Promise<CheckoutAttempt | null>;
   /** Tentative ouverte (ni terminée, ni refusée, ni abandonnée) pour un courriel. */
   openAttemptFor(email: string): Promise<string | null>;
@@ -143,5 +158,5 @@ export interface CheckoutRepository {
   reject(attemptId: string, token: string, refund: RefundResult, reason: string): Promise<void>;
   release(attemptId: string, token: string): Promise<void>;
   applySubscriptionState(state: SubscriptionState): Promise<boolean>;
-  updateRefundStatus(signal: RefundSignal): Promise<boolean>;
+  updateRefundStatus(state: RefundState): Promise<RefundSync>;
 }

@@ -86,7 +86,7 @@ select lives_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-822
   'Remboursement complet en cours : refus enregistré');
 select throws_ok($$ select public.checkout_attempt_finish('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'evt_tom', now() + interval '7 days') $$,
   'P0001', null, 'Tentative refusée : jamais de dossier');
-select public.checkout_attempt_refund_status('re_tom', 'failed');
+select public.checkout_attempt_refund_status('a2222222-2222-4222-8222-222222222222', 're_tom', 'failed');
 -- 6. Abandon : session expirée, puis paiement tardif remboursé
 select public.checkout_attempt_create('a3333333-3333-4333-8333-333333333333', 'ana@exemple.ca', '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet'));
 select public.checkout_attempt_save_session('a3333333-3333-4333-8333-333333333333', 'cs_test_ana');
@@ -100,9 +100,9 @@ select throws_ok($$ select public.checkout_attempt_subscription('a3333333-3333-4
 select lives_ok($$ select public.checkout_attempt_reject('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 're_ana', 4900, 'succeeded', 'paid_after_abandon') $$,
   'Payée après l''abandon : remboursée');
 update public.checkout_attempts set created_at = now() - interval '25 hours' where id = 'a4444444-4444-4444-8444-444444444444';
-select lives_ok($$ select public.checkout_attempt_create('a6666666-6666-4666-8666-666666666666', 'ana@exemple.ca',
+select throws_ok($$ select public.checkout_attempt_create('a6666666-6666-4666-8666-666666666666', 'ana@exemple.ca',
   '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet')) $$,
-  'Tentative non payée de plus de 24 h : abandonnée automatiquement');
+  'P0005', null, 'Tentative non payée de plus de 24 h : jamais abandonnée par la base (Stripe décide)');
 -- 7. État de l'abonnement relu chez Stripe
 select throws_ok($$ select public.apply_stripe_subscription_state('evt_inconnu', 'invoice.paid', 'sub_absent', 'active', now()) $$,
   'P0001', null, 'Abonnement pas encore associé : erreur pour que Stripe renvoie l''événement');
@@ -139,7 +139,7 @@ update public.checkout_attempts set created_at = now() - interval '31 days' wher
 update public.checkout_attempts set completed_at = now() - interval '91 days' where id = 'a1111111-1111-4111-8111-111111111111';
 update public.checkout_attempts set rejected_at = now() - interval '91 days' where id in ('a2222222-2222-4222-8222-222222222222', 'a3333333-3333-4333-8333-333333333333');
 select is((select deleted_unpaid || '/' || deleted_completed || '/' || anonymized_refused from public.purge_checkout_attempts()),
-  '2/1/1', 'Purge : non payées et terminées supprimées, refusée remboursée anonymisée');
+  '1/1/1', 'Purge : non payées et terminées supprimées, refusée remboursée anonymisée');
 select is((select email || '/' || refund_amount_cents from public.checkout_attempts where id = 'a3333333-3333-4333-8333-333333333333'),
   'efface+a3333333-3333-4333-8333-333333333333@invalid/4900', 'Refusée : coordonnées effacées, montant remboursé gardé');
 select is((select email from public.checkout_attempts where id = 'a2222222-2222-4222-8222-222222222222'), 'tom@exemple.ca',

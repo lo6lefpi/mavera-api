@@ -1,6 +1,6 @@
 import { assertEquals } from '../../domain/pricing/assert.ts';
 import { Stripe } from '../../../_shared/integrations/stripe/client.ts';
-import { checkoutEvent, refundSignal, subscriptionSignal, verifyWebhook } from '../../../_shared/integrations/stripe/webhook.ts';
+import { checkoutEvent, expiredCheckout, refundSignal, subscriptionSignal, verifyWebhook } from '../../../_shared/integrations/stripe/webhook.ts';
 
 const secret = 'whsec_local_test_signature_only';
 const sign = (payload: string) =>
@@ -39,14 +39,15 @@ Deno.test('signaux d\'abonnement : seulement les inscriptions, jamais le statut 
     { eventId: 'evt_customer.subscription.updated', type: 'customer.subscription.updated', subscriptionId: 'sub_1' });
 });
 
-Deno.test('remboursements : seulement ceux d\'une inscription, avec un statut connu', async () => {
+Deno.test('remboursements et sessions expirées : seulement ceux d\'une inscription', async () => {
   Deno.env.set('STRIPE_WEBHOOK_SECRET', secret);
   const failed = event('refund.failed', { id: 're_1', object: 'refund', status: 'failed', metadata: { attempt_id: 'a1' } });
   const other = event('refund.updated', { id: 're_2', object: 'refund', status: 'succeeded', metadata: {} });
-  const odd = event('refund.updated', { id: 're_3', object: 'refund', status: 'bizarre', metadata: { attempt_id: 'a1' } });
-  assertEquals(refundSignal(await verifyWebhook(failed, await sign(failed))), { refundId: 're_1', status: 'failed' });
+  assertEquals(refundSignal(await verifyWebhook(failed, await sign(failed))), { refundId: 're_1', attemptId: 'a1' });
   assertEquals(refundSignal(await verifyWebhook(other, await sign(other))), null);
-  assertEquals(refundSignal(await verifyWebhook(odd, await sign(odd))), null);
+  const expired = event('checkout.session.expired', { id: 'cs_1', object: 'checkout.session', metadata: { attempt_id: 'a1' } });
+  assertEquals(expiredCheckout(await verifyWebhook(expired, await sign(expired))), { attemptId: 'a1' });
+  assertEquals(checkoutEvent(await verifyWebhook(expired, await sign(expired))), null);
 });
 
 Deno.test('le SDK Stripe n\'est importé que dans integrations/stripe', async () => {

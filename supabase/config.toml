@@ -386,6 +386,15 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+# API publique du site : appelée sans session; protégée par la liste d'origines
+# et la vérification stricte de chaque champ.
+[functions.public-api]
+verify_jwt = false
+
+# Stripe n'envoie pas de jeton Supabase : la signature Stripe est vérifiée à la place.
+[functions.stripe-webhook]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 54327

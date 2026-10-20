@@ -3,7 +3,7 @@
  * vérifiée avant tout; le contenu de l'événement sert seulement à savoir quoi
  * relire chez Stripe, jamais de preuve de paiement.
  */
-import type { RefundSignal, RefundStatus, SubscriptionSignal } from '../../services/ports.ts';
+import type { RefundSignal, SubscriptionSignal } from '../../services/ports.ts';
 import { signatureVerifier, Stripe } from './client.ts';
 
 export async function verifyWebhook(body: string, signature: string | null): Promise<Stripe.Event> {
@@ -51,13 +51,18 @@ export function subscriptionSignal(event: Stripe.Event): SubscriptionSignal | nu
   return null;
 }
 
-const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'failed', 'canceled', 'requires_action']);
-
-/** Suivi d'un remboursement d'inscription (refund.updated, refund.failed). */
+/** Suivi d'un remboursement d'inscription (refund.updated, refund.failed) : le statut sera relu. */
 export function refundSignal(event: Stripe.Event): RefundSignal | null {
   if (event.type !== 'refund.updated' && event.type !== 'refund.failed') return null;
   const refund = event.data.object as Stripe.Refund;
   // Seuls les remboursements d'inscription portent attempt_id.
-  if (!refund.metadata?.attempt_id || !refund.status || !REFUND_STATUSES.has(refund.status)) return null;
-  return { refundId: refund.id, status: refund.status as RefundStatus };
+  const attemptId = refund.metadata?.attempt_id;
+  return attemptId ? { refundId: refund.id, attemptId } : null;
+}
+
+/** Session de paiement expirée : elle ne pourra plus être payée. */
+export function expiredCheckout(event: Stripe.Event): { attemptId: string } | null {
+  if (event.type !== 'checkout.session.expired') return null;
+  const attemptId = (event.data.object as Stripe.Checkout.Session).metadata?.attempt_id;
+  return attemptId ? { attemptId } : null;
 }

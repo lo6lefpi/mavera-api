@@ -1,12 +1,11 @@
-// deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { CheckoutAttempt, CheckoutQuote, Eligibility, PaymentProof, SignupInput, RefundResult,
-  RefundSignal, StripeSubscriptionRecord, SubscriptionState, CheckoutRepository } from '../../_shared/services/ports.ts';
+import type { SignupInput } from '../../_shared/services/ports.ts';
+import { FakeRepository } from './fake-repository.ts';
 import { SignupError } from '../../_shared/services/ports.ts';
 import { startCheckout, prepareQuote } from '../../_shared/services/start-checkout.ts';
 import { completeCheckout } from '../../_shared/services/complete-checkout.ts';
-import { syncRefund, syncSubscription } from '../../_shared/services/sync-billing.ts';
+import { closeExpiredSession, syncRefund, syncSubscription } from '../../_shared/services/sync-billing.ts';
 import { FakeStripeGateway } from '../../_shared/integrations/stripe/fake-gateway.ts';
 import { torontoMidnight } from '../../_shared/integrations/stripe/time.ts';
 
@@ -18,72 +17,6 @@ const input = (extra: Partial<SignupInput> = {}): SignupInput => ({
 });
 const SECOND = '0b6d9f0e-3c1a-4f7e-9a51-6c2d8e4f1a20';
 
-/** Mêmes règles que les fonctions SQL, en mémoire. */
-class FakeRepository implements CheckoutRepository {
-  attempts = new Map<string, CheckoutAttempt>();
-  eligibility: Eligibility = 'new';
-  token: string | null = null;
-  completeCalls = 0;
-  failOnce = false;
-  reasons = new Map<string, string>();
-  refundStatus = new Map<string, string>();
-  states: SubscriptionState[] = [];
-  checkEligibility(): Promise<Eligibility> { return Promise.resolve(this.eligibility); }
-  async createAttempt(i: SignupInput, quote: CheckoutQuote) {
-    if (await this.openAttemptFor(i.email)) throw new Error('P0005 tentative ouverte');
-    const attempt: CheckoutAttempt = { id: i.attemptId, createdAt: new Date().toISOString(),
-      email: i.email, phone: i.phone, displayName: i.displayName,
-      booksUpToDate: i.booksUpToDate, usesQuickbooks: i.usesQuickbooks,
-      estimatedTransactions: i.estimatedTransactions, quote,
-      stripeSessionId: null, stripeCustomerId: null, stripePaymentIntentId: null,
-      stripeSubscriptionId: null, stripePriceId: null, stripeStatus: null, paidAmountCents: null,
-      paidAt: null, completedAt: null, rejectedAt: null, abandonedAt: null, refundId: null };
-    this.attempts.set(i.attemptId, attempt); return attempt;
-  }
-  getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
-  openAttemptFor(email: string) {
-    const open = [...this.attempts.values()].find(a => a.email === email &&
-      !a.completedAt && !a.rejectedAt && !a.abandonedAt);
-    return Promise.resolve(open?.id ?? null);
-  }
-  async abandon(id: string) {
-    const a = this.attempts.get(id)!;
-    if (a.paidAt || this.token) throw new Error('P0001 tentative payée ou verrouillée');
-    a.abandonedAt = new Date().toISOString();
-  }
-  async saveSession(id: string, sessionId: string) { this.attempts.get(id)!.stripeSessionId = sessionId; }
-  async claim(_id: string, token: string) { if (this.token) return false; this.token = token; return true; }
-  async savePayment(id: string, _token: string, proof: PaymentProof) {
-    const a = this.attempts.get(id)!;
-    a.stripeCustomerId = proof.customerId; a.stripePaymentIntentId = proof.paymentIntentId;
-    a.paidAt = proof.paidAt; a.paidAmountCents = proof.amountPaidCents;
-  }
-  async saveSubscription(id: string, _token: string, s: StripeSubscriptionRecord) {
-    const a = this.attempts.get(id)!;
-    a.stripeSubscriptionId = s.subscriptionId; a.stripePriceId = s.priceId; a.stripeStatus = s.status;
-  }
-  async complete(id: string) {
-    this.completeCalls++;
-    if (this.failOnce) { this.failOnce = false; throw new Error('temporary SQL failure'); }
-    this.attempts.get(id)!.completedAt = new Date().toISOString();
-    return 'client_id';
-  }
-  async reject(id: string, _token: string, refund: RefundResult, reason: string) {
-    const a = this.attempts.get(id)!;
-    // Mêmes exigences que checkout_attempt_reject.
-    if (!['pending', 'succeeded'].includes(refund.status) || refund.amountCents !== a.paidAmountCents) {
-      throw new Error('22023 remboursement non conforme');
-    }
-    a.rejectedAt = new Date().toISOString(); a.refundId = refund.refundId;
-    this.reasons.set(id, reason); this.refundStatus.set(refund.refundId, refund.status);
-  }
-  async release() { this.token = null; }
-  async applySubscriptionState(state: SubscriptionState) { this.states.push(state); return true; }
-  async updateRefundStatus(signal: RefundSignal) {
-    if (!this.refundStatus.has(signal.refundId)) return false;
-    this.refundStatus.set(signal.refundId, signal.status); return true;
-  }
-}
 const deps = (repo: FakeRepository, stripe: FakeStripeGateway) => ({ repository: repo, billing: stripe });
 const signupError = (code: string) => (error: unknown) => error instanceof SignupError && error.code === code;
 
@@ -272,13 +205,57 @@ test('abonnement : le statut appliqué est celui relu chez Stripe, avec l\'heure
   assert.equal(repo.states[0].eventId, 'evt_old');
 });
 
-test('suivi du remboursement : seul un remboursement connu est mis à jour', async () => {
+test('suivi du remboursement : statut relu chez Stripe; pas encore enregistré → erreur pour reprise', async () => {
   const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
   await startCheckout(input(), deps(repo, stripe), '2026-10-20');
   repo.eligibility = 'refused'; stripe.nextRefundStatus = 'pending';
   await completeCheckout(input().attemptId, 'evt_p', deps(repo, stripe));
   const refundId = repo.attempts.get(input().attemptId)!.refundId!;
-  assert.equal(await syncRefund({ refundId, status: 'failed' }, { repository: repo }), true);
+  stripe.refunds.get(input().attemptId)!.status = 'failed';               // l'événement ne dit rien : relu chez Stripe
+  assert.equal(await syncRefund({ refundId, attemptId: input().attemptId }, deps(repo, stripe)), 'updated');
   assert.equal(repo.refundStatus.get(refundId), 'failed');
-  assert.equal(await syncRefund({ refundId: 're_inconnu', status: 'failed' }, { repository: repo }), false);
+
+  // Remboursement créé chez Stripe, refus pas encore enregistré (événement arrivé trop tôt).
+  const repo2 = new FakeRepository(); const stripe2 = new FakeStripeGateway();
+  await startCheckout(input(), deps(repo2, stripe2), '2026-10-20');
+  const early = await stripe2.refund({ attemptId: input().attemptId, paymentIntentId: 'pi', amountCents: 17800, reason: 'x' });
+  await assert.rejects(syncRefund({ refundId: early.refundId, attemptId: input().attemptId }, deps(repo2, stripe2)),
+    /pas encore enregistré/);
+  assert.equal(await syncRefund({ refundId: early.refundId, attemptId: SECOND }, deps(repo2, stripe2)), 'unknown_attempt');
+});
+
+test('même identifiant avec d\'autres choix : refusé, aucune ancienne session renvoyée', async () => {
+  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
+  await startCheckout(input({ startMonth: 'next' }), deps(repo, stripe), '2026-10-20');
+  for (const changed of [{ startMonth: 'current' as const }, { estimatedTransactions: 15 }, { usesQuickbooks: true }]) {
+    await assert.rejects(startCheckout(input({ startMonth: 'next', ...changed }), deps(repo, stripe), '2026-10-20'),
+      signupError('attempt_conflict'));
+  }
+  // Même demande (courriel en majuscules compris) : même session.
+  await startCheckout(input({ startMonth: 'next', email: 'TEST@example.ca' }), deps(repo, stripe), '2026-10-20');
+  assert.equal(stripe.checkoutCreates, 1);
+});
+
+test('session expirée : le même identifiant est refusé, un nouvel identifiant obtient une nouvelle page', async () => {
+  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
+  const first = await startCheckout(input(), deps(repo, stripe), '2026-10-20');
+  stripe.sessionStatus.set(first.sessionId, 'expired');                   // expirée chez Stripe, base pas encore au courant
+  await assert.rejects(startCheckout(input(), deps(repo, stripe), '2026-10-20'), signupError('attempt_expired'));
+  const second = await startCheckout(input({ attemptId: SECOND }), deps(repo, stripe), '2026-10-20');
+  assert.notEqual(second.sessionId, first.sessionId);
+  assert.equal(stripe.sessionStatus.get(second.sessionId), 'open');
+  assert.ok(repo.attempts.get(input().attemptId)!.abandonedAt);
+});
+
+test('événement « session expirée » : tentative non payée abandonnée, jamais une tentative payée', async () => {
+  const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
+  await startCheckout(input(), deps(repo, stripe), '2026-10-20');
+  assert.equal(await closeExpiredSession(input().attemptId, { repository: repo }), 'abandoned');
+  assert.equal(await closeExpiredSession(input().attemptId, { repository: repo }), 'unchanged');
+  const repo2 = new FakeRepository();
+  await startCheckout(input(), deps(repo2, new FakeStripeGateway()), '2026-10-20');
+  repo2.attempts.get(input().attemptId)!.paidAt = new Date().toISOString();
+  assert.equal(await closeExpiredSession(input().attemptId, { repository: repo2 }), 'unchanged');
+  assert.equal(repo2.attempts.get(input().attemptId)!.abandonedAt, null);
+  assert.equal(await closeExpiredSession(SECOND, { repository: repo2 }), 'unknown_attempt');
 });
