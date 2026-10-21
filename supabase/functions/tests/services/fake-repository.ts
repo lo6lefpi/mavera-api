@@ -1,11 +1,12 @@
 // deno-lint-ignore-file require-await -- faux dépôt : mêmes signatures async que le vrai, sans attente réelle.
 /** Faux dépôt pour les tests de services et d'API : uniquement pour les tests. */
-import type { CheckoutAttempt, CheckoutQuote, CheckoutRepository, Eligibility, PaymentProof, RefundResult,
+import type { CheckoutAttempt, CheckoutQuote, CheckoutRepository, CheckoutStatusSnapshot, Eligibility, PaymentProof, RefundResult,
   RefundState, RefundSync, SignupInput, StripeSubscriptionRecord, SubscriptionState } from '../../_shared/services/ports.ts';
 
 /** Mêmes règles que les fonctions SQL, en mémoire. */
 export class FakeRepository implements CheckoutRepository {
   attempts = new Map<string, CheckoutAttempt>();
+  statusSnapshots = new Map<string, CheckoutStatusSnapshot>();
   eligibility: Eligibility = 'new';
   token: string | null = null;
   completeCalls = 0;
@@ -26,6 +27,7 @@ export class FakeRepository implements CheckoutRepository {
     this.attempts.set(i.attemptId, attempt); return attempt;
   }
   getAttempt(id: string) { return Promise.resolve(this.attempts.get(id) ?? null); }
+  async getStatusBySession(sessionId: string) { return this.statusSnapshots.get(sessionId) ?? null; }
   openAttemptFor(email: string) {
     const open = [...this.attempts.values()].find(a => a.email === email &&
       !a.completedAt && !a.rejectedAt && !a.abandonedAt);

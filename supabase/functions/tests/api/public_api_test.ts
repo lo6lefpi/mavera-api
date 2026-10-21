@@ -190,6 +190,7 @@ test('trop d\'appels : 429 par adresse IP, puis par courriel', async () => {
   for (let i = 0; i <= LIMITS.ip.limit; i++) last = await handlePublicApi(post('checkout', '{pas du json'), deps);
   assert.equal(last!.status, 429);
   assert.equal(last!.headers.get('retry-after'), String(LIMITS.ip.windowSeconds));
+  assert.equal(last!.headers.get('access-control-expose-headers'), 'Retry-After');
 
   const fresh = setup();
   for (let i = 0; i < LIMITS.email.limit; i++) {
@@ -197,6 +198,7 @@ test('trop d\'appels : 429 par adresse IP, puis par courriel', async () => {
   }
   const res = await handlePublicApi(post('checkout', body(), SITE, '198.51.100.99'), fresh.deps);
   assert.equal(res.status, 429);
+  assert.equal(res.headers.get('access-control-expose-headers'), 'Retry-After');
   assert.equal((await error(res)).code, 'too_many_requests');
 });
 

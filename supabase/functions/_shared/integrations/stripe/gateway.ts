@@ -6,6 +6,7 @@
 import {
   BillingTerminalError,
   type BillingGateway,
+  type CheckoutSessionState,
   type PaymentProof,
   type RefundResult,
   type RefundStatus,
@@ -24,8 +25,18 @@ const REFUND_STATUSES: ReadonlySet<string> = new Set(['pending', 'succeeded', 'f
 const refundStatusOf = (status: string | null): RefundStatus =>
   status && REFUND_STATUSES.has(status) ? status as RefundStatus : 'requires_action';
 
+/** Stripe remplace ce marqueur littéral au retour. Ne pas encoder ses accolades. */
+export function checkoutSuccessUrl(value: string): string {
+  const url = new URL(value);
+  // Remplace aussi une ancienne valeur ou un marqueur déjà fourni par le site.
+  url.searchParams.delete('session_id');
+  const hash = url.hash;
+  url.hash = '';
+  return `${url.toString()}${url.search ? '&' : '?'}session_id={CHECKOUT_SESSION_ID}${hash}`;
+}
+
 export class StripeGateway implements BillingGateway {
-  private stripe = stripeClient();
+  constructor(private readonly stripe: Stripe = stripeClient()) {}
 
   async createCheckoutSession(input: Parameters<BillingGateway['createCheckoutSession']>[0]) {
     // Avant toute création : la session doit expirer avant le prélèvement du 1er.
@@ -57,7 +68,7 @@ export class StripeGateway implements BillingGateway {
         // TPS et TVQ ajoutées par Stripe sur chaque ligne, avec les taux fixes du Québec.
         tax_rates: taxRates,
       })),
-      success_url: input.successUrl,
+      success_url: checkoutSuccessUrl(input.successUrl),
       cancel_url: input.cancelUrl,
     }, { idempotencyKey: `checkout:create:${input.attemptId}` });
     if (!session.url) throw new Error('Stripe ne fournit aucune adresse de paiement');
@@ -74,6 +85,25 @@ export class StripeGateway implements BillingGateway {
     const session = await this.stripe.checkout.sessions.retrieve(sessionId);
     // Une session expirée ou terminée n'a plus d'adresse utilisable.
     return { sessionId: session.id, url: session.status === 'open' ? session.url : null };
+  }
+
+  async getCheckoutStatus(sessionId: string): Promise<CheckoutSessionState | null> {
+    let session;
+    try {
+      session = await this.stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+    } catch (error) {
+      // Une ressource absente n'est pas une panne. Authentification/réseau restent des erreurs.
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'resource_missing') return null;
+      throw error;
+    }
+    const paymentIntent = session.payment_intent;
+    const intent = typeof paymentIntent === 'string'
+      ? await this.stripe.paymentIntents.retrieve(paymentIntent) : paymentIntent;
+    return {
+      sessionId: session.id, attemptId: session.metadata?.attempt_id ?? '', mode: session.mode,
+      status: session.status, paymentStatus: session.payment_status,
+      paymentIntentStatus: intent?.status ?? null,
+    };
   }
 
   /**

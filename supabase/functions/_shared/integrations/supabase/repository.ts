@@ -8,6 +8,7 @@ import {
   type CheckoutAttempt,
   type CheckoutQuote,
   type CheckoutRepository,
+  type CheckoutStatusSnapshot,
   type Eligibility,
   type PaymentProof,
   type RefundResult,
@@ -116,6 +117,24 @@ export class SupabaseCheckoutRepository implements CheckoutRepository {
   async getAttempt(attemptId: string) {
     const rows = await this.call<Row[]>('checkout_attempt_get', { p_id: attemptId });
     return rows && rows.length ? mapAttempt(rows[0]) : null;
+  }
+
+  async getStatusBySession(sessionId: string): Promise<CheckoutStatusSnapshot | null> {
+    const rows = await this.call<Row[]>('checkout_attempt_status_by_session', { p_session_id: sessionId });
+    const row = rows?.[0];
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      stripeSessionId: String(row.stripe_session_id),
+      quote: row.granted_quote as CheckoutQuote,
+      paidAt: text(row.paid_at),
+      paidAmountCents: row.paid_amount_cents == null ? null : Number(row.paid_amount_cents),
+      completedAt: text(row.completed_at),
+      rejectedAt: text(row.rejected_at),
+      refundId: text(row.refund_id),
+      refundAmountCents: row.refund_amount_cents == null ? null : Number(row.refund_amount_cents),
+      dossierExists: row.dossier_exists === true,
+    };
   }
 
   openAttemptFor(email: string) {

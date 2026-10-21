@@ -91,6 +91,30 @@ export interface CheckoutAttempt {
   requestFingerprint: string | null;
 }
 
+/** Lecture minimale pour le retour du site, sans coordonnées ni motif de refus. */
+export interface CheckoutStatusSnapshot {
+  id: string;
+  stripeSessionId: string;
+  quote: CheckoutQuote;
+  paidAt: string | null;
+  paidAmountCents: number | null;
+  completedAt: string | null;
+  rejectedAt: string | null;
+  refundId: string | null;
+  refundAmountCents: number | null;
+  dossierExists: boolean;
+}
+
+/** Faits Stripe relus sans effet de bord, jamais renvoyés au navigateur. */
+export interface CheckoutSessionState {
+  sessionId: string;
+  attemptId: string;
+  mode: string;
+  status: string | null;
+  paymentStatus: string;
+  paymentIntentStatus: string | null;
+}
+
 /** Signal d'un événement d'abonnement : l'état réel est relu chez Stripe. */
 export interface SubscriptionSignal {
   eventId: string;
@@ -121,6 +145,7 @@ export interface BillingGateway {
     payBefore: IsoDate;
   }): Promise<{ sessionId: string; url: string }>;
   getCheckoutSession(sessionId: string): Promise<{ sessionId: string; url: string | null }>;
+  getCheckoutStatus(sessionId: string): Promise<CheckoutSessionState | null>;
   /** Empêche une session de paiement d'être payée (remplacement par une nouvelle). */
   expireCheckoutSession(sessionId: string): Promise<SessionExpiry>;
   getPaymentProof(sessionId: string): Promise<PaymentProof>;
@@ -148,6 +173,7 @@ export interface CheckoutRepository {
   checkEligibility(email: string, phone: string, customerId?: string): Promise<Eligibility>;
   createAttempt(input: SignupInput, quote: CheckoutQuote, requestFingerprint: string): Promise<CheckoutAttempt>;
   getAttempt(attemptId: string): Promise<CheckoutAttempt | null>;
+  getStatusBySession(sessionId: string): Promise<CheckoutStatusSnapshot | null>;
   /** Tentative ouverte (ni terminée, ni refusée, ni abandonnée) pour un courriel. */
   openAttemptFor(email: string): Promise<string | null>;
   /** Abandonne une tentative jamais payée, après l'expiration de sa session chez Stripe. */

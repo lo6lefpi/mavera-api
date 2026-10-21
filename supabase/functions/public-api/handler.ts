@@ -1,5 +1,5 @@
 /**
- * API publique du site : récapitulatif (/quote) et paiement (/checkout).
+ * API publique du site : récapitulatif, paiement et consultation de l'inscription.
  *
  * /quote est un simple calcul : public, sans base ni Stripe.
  * /checkout crée des ressources Stripe : la vérification d'origine ne suffit pas
@@ -22,6 +22,7 @@ import {
   type SignupInput,
 } from '../_shared/services/ports.ts';
 import { prepareQuote, type QuoteRequest, startCheckout } from '../_shared/services/start-checkout.ts';
+import { checkoutStatus, parseCheckoutSessionId } from '../_shared/services/checkout-status.ts';
 
 export interface RateLimiter {
   /** true si l'appel est permis (et le compte), false si la limite est atteinte. */
@@ -29,7 +30,7 @@ export interface RateLimiter {
 }
 
 export interface PublicApiDeps {
-  /** Créés seulement pour /checkout : /quote n'a besoin ni de Stripe ni de la base. */
+  /** /checkout et /checkout-status seulement : /quote reste sans Stripe ni base. */
   checkoutDeps(): { billing: BillingGateway; repository: CheckoutRepository };
   rateLimiter(): RateLimiter;
   /** null : vérification antirobot désactivée (développement local seulement). */
@@ -45,6 +46,11 @@ const MAX_BODY = 16_384;
 export const LIMITS = {
   ip: { limit: 20, windowSeconds: 3600 },
   email: { limit: 5, windowSeconds: 3600 },
+} as const;
+
+export const STATUS_LIMITS = {
+  ip: { limit: 60, windowSeconds: 60 },
+  session: { limit: 20, windowSeconds: 60 },
 } as const;
 
 export type ApiErrorCode =
@@ -218,7 +224,11 @@ async function enforce(limiter: RateLimiter, key: string, rule: { limit: number;
 // ---------- Réponses
 
 function cors(origin: string, origins: readonly string[]): Record<string, string> {
-  return origins.includes(origin) ? { 'access-control-allow-origin': origin, vary: 'origin' } : { vary: 'origin' };
+  return origins.includes(origin) ? {
+    'access-control-allow-origin': origin,
+    'access-control-expose-headers': 'Retry-After',
+    vary: 'origin',
+  } : { vary: 'origin' };
 }
 function json(body: unknown, status: number, origin: string, origins: readonly string[],
   extra: Record<string, string> = {}): Response {
@@ -259,13 +269,16 @@ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Pr
   try {
     if (request.method !== 'POST') throw new ApiError('method_not_allowed');
     if (!origins.length) throw new Error('Origines autorisées non configurées');
-    if (route !== 'quote' && route !== 'checkout') throw new ApiError('not_found');
-    // /checkout : l'origine est obligatoire (un navigateur l'envoie toujours sur un POST).
-    if ((route === 'checkout' || origin) && !origins.includes(origin)) throw new ApiError('origin_refused');
+    if (route !== 'quote' && route !== 'checkout' && route !== 'checkout-status') throw new ApiError('not_found');
+    // L'origine est obligatoire pour les routes utilisant la base et Stripe.
+    if ((route !== 'quote' || origin) && !origins.includes(origin)) throw new ApiError('origin_refused');
 
     const ip = clientIp(request);
     // Compté avant toute lecture : un envoi massif de requêtes invalides est aussi limité.
     if (route === 'checkout') await enforce(deps.rateLimiter(), `checkout:ip:${ip ?? 'inconnue'}`, LIMITS.ip);
+    if (route === 'checkout-status') {
+      await enforce(deps.rateLimiter(), `checkout-status:ip:${ip ?? 'inconnue'}`, STATUS_LIMITS.ip);
+    }
 
     const raw = await readBody(request);
     let body: unknown;
@@ -275,6 +288,11 @@ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Pr
 
     if (route === 'quote') {
       return json({ quote: prepareQuote(parseQuote(fields), deps.today()) }, 200, origin, origins);
+    }
+    if (route === 'checkout-status') {
+      const sessionId = parseCheckoutSessionId(fields.sessionId);
+      await enforce(deps.rateLimiter(), `checkout-status:session:${ip ?? 'inconnue'}:${sessionId}`, STATUS_LIMITS.session);
+      return json(await checkoutStatus(sessionId, deps.checkoutDeps()), 200, origin, origins);
     }
     const input = parseSignup(fields, origins);
     if (deps.humanCheck) {
@@ -287,7 +305,8 @@ export async function handlePublicApi(request: Request, deps: PublicApiDeps): Pr
   } catch (error) {
     const apiError = toApiError(error);
     if (apiError.code === 'unavailable') {
-      console.error('public-api : panne', route, error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+      if (route === 'checkout-status') console.error('public-api : panne', route);
+      else console.error('public-api : panne', route, error instanceof Error ? `${error.name}: ${error.message}` : String(error));
     }
     return errorResponse(apiError, origin, origins);
   }

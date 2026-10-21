@@ -4,7 +4,7 @@
  * Prérequis (trois terminaux) :
  *   1. supabase start   puis   supabase functions serve
  *   2. stripe listen --forward-to localhost:54321/functions/v1/stripe-webhook
- *   3. deno run -A --env-file=supabase/functions/.env scripts/e2e-checkout.ts [forfait] [option] [mois]
+ *   3. deno run -A --env-file=supabase/functions/.env scripts/e2e-checkout.ts [forfait] [option] [mois] [parcours]
  *        ex. scripts/e2e-checkout.ts depart monthly current
  *
  * Le script crée l'inscription, affiche la page de paiement Stripe (payer avec
@@ -13,11 +13,15 @@
  * pour confirmer qu'aucun deuxième dossier n'est créé.
  */
 import { createClient } from 'npm:@supabase/supabase-js@2.117.2';
-import { Stripe, stripeClient } from '../supabase/functions/_shared/integrations/stripe/client.ts';
+import { Stripe, STRIPE_API_VERSION } from '../supabase/functions/_shared/integrations/stripe/client.ts';
 import { torontoMidnight } from '../supabase/functions/_shared/integrations/stripe/time.ts';
 import type { CheckoutQuote } from '../supabase/functions/_shared/domain/pricing/mod.ts';
+import type { SignupInput } from '../supabase/functions/_shared/services/ports.ts';
+import {
+  BANK_ACCOUNTS, createBankCheckout, type E2EContext, e2eFetch, E2E_NETWORK_TIMEOUT_MS, type Scenario, verifyBank, verifyRejected,
+} from './e2e-checkout-scenarios.ts';
 
-const [planCode = 'depart', billingOption = 'monthly', startMonth = 'current'] = Deno.args;
+const [planCode = 'depart', billingOption = 'monthly', startMonth = 'current', scenario = 'card'] = Deno.args;
 const results: { ok: boolean; label: string; detail?: string }[] = [];
 const check = (ok: boolean, label: string, detail?: string) => {
   results.push({ ok, label, detail });
@@ -41,7 +45,7 @@ async function localSupabase(): Promise<{ url: string; serviceKey: string }> {
   return { url, serviceKey };
 }
 
-async function main() {
+async function main(mode: Scenario) {
   if (!(Deno.env.get('STRIPE_SECRET_KEY') ?? '').startsWith('sk_test_')) {
     throw new Error('STRIPE_SECRET_KEY doit être une clé de bac à sable (sk_test_…)');
   }
@@ -49,35 +53,77 @@ async function main() {
   const site = Deno.env.get('PUBLIC_SITE_ORIGIN');
   if (!webhookSecret || !site) throw new Error('STRIPE_WEBHOOK_SECRET et PUBLIC_SITE_ORIGIN sont requis');
   const { url, serviceKey } = await localSupabase();
-  const db = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
-  const stripe = stripeClient();
+  const db = createClient(url, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false }, global: { fetch: e2eFetch },
+  });
+  const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!, {
+    apiVersion: STRIPE_API_VERSION, httpClient: Stripe.createFetchHttpClient(e2eFetch),
+    timeout: E2E_NETWORK_TIMEOUT_MS, maxNetworkRetries: 0,
+  });
   const startedAt = Math.floor(Date.now() / 1000);
+  const ctx: E2EContext = { db, stripe, url, site, webhookSecret, startedAt };
+  const bank = mode === 'acss-success' || mode === 'acss-failure';
 
   // 1. Inscription, comme le site
   const attemptId = crypto.randomUUID();
-  const email = `e2e+${Date.now()}@example.com`;
-  console.log(`\n1. Inscription ${planCode} / ${billingOption} / ${startMonth} (${email})`);
-  const res = await fetch(`${url}/functions/v1/public-api/checkout`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', origin: site },
-    body: JSON.stringify({
-      attemptId, email, phone: '514 555 0199', displayName: 'Test bout en bout',
-      planCode, billingOption, startMonth, booksUpToDate: true, usesQuickbooks: false,
-      estimatedTransactions: 12,
-      ...(planCode === 'trajet'
-        ? { trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 12 } }
-        : {}),
-      successUrl: `${site}/merci`, cancelUrl: `${site}/forfaits`,
-      captchaToken: Deno.env.get('E2E_CAPTCHA_TOKEN') ?? 'XXXX.DUMMY.TOKEN.XXXX',
-    }),
-  });
-  const body = await res.json();
-  if (res.status !== 200) throw new Error(`public-api a répondu ${res.status} : ${JSON.stringify(body)}`);
+
+  const email = mode === 'card' ? 'e2e+1792592047468@example.com' : `e2e+${mode}-${attemptId}@example.com`;
+  console.log(`\n1. Inscription ${mode} : ${planCode} / ${billingOption} / ${startMonth} (${email})`);
+  const signup = {
+    attemptId, email, phone: '514 555 0199', displayName: 'Test bout en bout',
+    planCode, billingOption, startMonth, booksUpToDate: true, usesQuickbooks: false,
+    estimatedTransactions: 12,
+    ...(planCode === 'trajet'
+      ? { trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 12 } }
+      : {}),
+    successUrl: `${site}/commencer/confirmation`, cancelUrl: `${site}/forfaits`,
+    captchaToken: Deno.env.get('E2E_CAPTCHA_TOKEN') ?? 'XXXX.DUMMY.TOKEN.XXXX',
+  };
+  let body: { url: string; quote: CheckoutQuote };
+  if (bank) {
+    console.log('   Montage ACSS sandbox : /quote → tentative locale → Checkout bancaire → vrai webhook');
+    body = await createBankCheckout(ctx, signup as SignupInput);
+  } else {
+    const res = await e2eFetch(`${url}/functions/v1/public-api/checkout`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: site },
+      body: JSON.stringify(signup),
+    });
+    body = await res.json();
+    if (res.status !== 200) throw new Error(`public-api a répondu ${res.status} : ${JSON.stringify(body)}`);
+  }
   const quote = body.quote as CheckoutQuote;
   const $ = (cents: number) => `${(cents / 100).toFixed(2)} $`;
   console.log(`   Aujourd'hui : ${$(quote.dueToday.subtotalCents)} + TPS ${$(quote.dueToday.gstCents)} + TVQ ${$(quote.dueToday.qstCents)} = ${$(quote.dueToday.totalCents)}`);
   console.log(`   Puis ${$(quote.recurring.totalCents)} taxes comprises, à partir du ${quote.recurring.nextChargeOn}`);
-  console.log(`\n2. Payez sur cette page (carte 4242 4242 4242 4242) :\n\n   ${body.url}\n`);
+  if (mode === 'rejected') {
+    // Injection locale avant de montrer la page : simule une ancienne inscription
+    // abandonnée dont la session serait néanmoins payée. Le vrai webhook rembourse.
+    const { error } = await db.rpc('checkout_attempt_abandon', { p_id: attemptId });
+    if (error) throw new Error(`Préparation du refus : ${error.message}`);
+    console.log('   Tentative de test abandonnée : le paiement devra être remboursé avant le refus.');
+  }
+  console.log(`\n2. Payez sur cette page :\n\n   ${body.url}\n`);
+  if (bank) {
+    const outcome = mode === 'acss-success' ? 'success' : 'failure';
+    console.log(`   Choisir le débit bancaire ACSS, institution 000, transit 11000, compte ${BANK_ACCOUNTS[outcome]}.`);
+    console.log('   Vérifier les microdépôts : 32 et 45 cents. Le résultat arrive environ trois minutes après.');
+    await verifyBank(ctx, attemptId, email, outcome);
+    check(true, 'Attente bancaire vérifiée sans dossier ni abonnement');
+    if (mode === 'acss-failure') {
+      check(true, 'Débit bancaire refusé : aucune création, même après rejeu des événements');
+      console.log(`\n✓ Parcours ${mode} réussi. Tentative ${attemptId}`);
+      return;
+    }
+  } else {
+    console.log('   Carte de test 4242 4242 4242 4242, date future et CVC quelconque.');
+  }
+  if (mode === 'rejected') {
+    await verifyRejected(ctx, attemptId, email, quote);
+    check(true, 'Remboursement complet accepté, refus enregistré, aucun dossier ni abonnement');
+    console.log(`\n✓ Parcours ${mode} réussi. Tentative ${attemptId}`);
+    return;
+  }
 
   // 2. Attendre le webhook
   type Row = Record<string, unknown>;
@@ -105,9 +151,11 @@ async function main() {
   check(intent.amount_received === quote.dueToday.totalCents && intent.currency === 'cad',
     `Encaissé : ${(intent.amount_received / 100).toFixed(2)} $ CAD, taxes comprises`, `attendu ${quote.dueToday.totalCents} cents`);
   const session = await stripe.checkout.sessions.retrieve(String(attempt.stripe_session_id));
+  // Notre code calcule la TPS et la TVQ dans domain/pricing ; Stripe applique
+  // les mêmes taux fixes, sans Stripe Tax. On vérifie ici la concordance.
   check(session.total_details?.amount_tax === quote.dueToday.gstCents + quote.dueToday.qstCents,
-    `Taxes calculées par Stripe : ${$(session.total_details?.amount_tax ?? 0)}`,
-    `attendu ${quote.dueToday.gstCents + quote.dueToday.qstCents} cents`);
+    `Taxes conformes au calcul de notre code (sans Stripe Tax) : ${$(session.total_details?.amount_tax ?? 0)}`,
+    `attendu selon notre code : ${quote.dueToday.gstCents + quote.dueToday.qstCents} cents`);
   const sub = await stripe.subscriptions.retrieve(String(attempt.stripe_subscription_id), { expand: ['latest_invoice'] });
   const item = sub.items.data[0];
   check(item?.price.lookup_key === quote.terms.stripeRecurringLookupKey && item?.price.unit_amount === quote.recurring.amountCents,
@@ -148,17 +196,18 @@ async function main() {
   // 5. Rejouer l'événement : aucun deuxième dossier
   console.log('\n5. Événement reçu deux fois');
   let event: Stripe.Event | undefined;
-  for await (const e of stripe.events.list({ type: 'checkout.session.completed', created: { gte: startedAt - 60 }, limit: 100 })) {
+  const eventType = bank ? 'checkout.session.async_payment_succeeded' : 'checkout.session.completed';
+  for await (const e of stripe.events.list({ type: eventType, created: { gte: startedAt - 60 }, limit: 100 })) {
     if ((e.data.object as Stripe.Checkout.Session).id === attempt.stripe_session_id) { event = e; break; }
   }
   if (!event) {
-    check(false, 'Événement checkout.session.completed retrouvé chez Stripe');
+    check(false, `Événement ${eventType} retrouvé chez Stripe`);
   } else {
     const payload = JSON.stringify(event);
     const signature = await stripe.webhooks.generateTestHeaderStringAsync({
       payload, secret: webhookSecret, cryptoProvider: Stripe.createSubtleCryptoProvider(),
     });
-    const replay = await fetch(`${url}/functions/v1/stripe-webhook`, {
+    const replay = await e2eFetch(`${url}/functions/v1/stripe-webhook`, {
       method: 'POST', headers: { 'stripe-signature': signature, 'content-type': 'application/json' }, body: payload,
     });
     const text = await replay.text();
@@ -174,9 +223,16 @@ async function main() {
   if (failed) Deno.exit(1);
 }
 
-try {
-  await main();
-} catch (error) {
-  console.error(`\nÉchec : ${error instanceof Error ? error.message : String(error)}`);
-  Deno.exit(1);
+if (import.meta.main) {
+  try {
+    if (!['card', 'acss', 'acss-success', 'acss-failure', 'rejected'].includes(scenario)) {
+      throw new Error('Parcours inconnu : card, acss (les deux résultats), acss-success, acss-failure ou rejected');
+    }
+    for (const mode of scenario === 'acss' ? ['acss-success', 'acss-failure'] as const : [scenario as Scenario]) {
+      await main(mode);
+    }
+  } catch (error) {
+    console.error(`\nÉchec : ${error instanceof Error ? error.message : String(error)}`);
+    Deno.exit(1);
+  }
 }

@@ -79,3 +79,27 @@ test('limite d\'appels : réponse de rate_limit_hit, erreur SQL remontée', asyn
   const ko = fakeDb(() => ({ error: { code: '08006', message: 'connexion perdue' } }));
   await assert.rejects(new SupabaseRateLimiter(ko.db).allow('k', 1, 60), DatabaseError);
 });
+
+test('statut par session : RPC de lecture exacte, montant remboursé et preuve de dossier', async () => {
+  const row = { id: 'a', stripe_session_id: 'cs_test_read', granted_quote: { terms: { planCode: 'envol' } },
+    paid_at: '2026-10-20T12:00:00Z', paid_amount_cents: 20466, completed_at: null,
+    rejected_at: '2026-10-20T12:01:00Z', refund_id: 're_private', refund_amount_cents: 20466,
+    dossier_exists: true, email: 'never@expose.ca', phone: '514', rejection_reason: 'private' };
+  const { db, calls } = fakeDb(() => ({ data: [row] }));
+  assert.deepEqual(await new SupabaseCheckoutRepository(db).getStatusBySession('cs_test_read'), {
+    id: 'a', stripeSessionId: 'cs_test_read', quote: row.granted_quote,
+    paidAt: row.paid_at, paidAmountCents: 20466, completedAt: null, rejectedAt: row.rejected_at,
+    refundId: 're_private', refundAmountCents: 20466, dossierExists: true,
+  });
+  assert.deepEqual(calls, [{ fn: 'checkout_attempt_status_by_session', params: { p_session_id: 'cs_test_read' } }]);
+  const absent = fakeDb(() => ({ data: [] }));
+  assert.equal(await new SupabaseCheckoutRepository(absent.db).getStatusBySession('cs_unknown'), null);
+  const unpaid = fakeDb(() => ({ data: [{ ...row, paid_at: null, paid_amount_cents: null,
+    refund_id: null, refund_amount_cents: null, dossier_exists: false }] }));
+  const a = await new SupabaseCheckoutRepository(unpaid.db).getStatusBySession('cs_test_read');
+  assert.equal(a?.paidAmountCents, null);
+  assert.equal(a?.refundAmountCents, null);
+  assert.equal(a?.dossierExists, false);
+  const broken = fakeDb(() => ({ error: { code: '08006', message: 'db failure' } }));
+  await assert.rejects(new SupabaseCheckoutRepository(broken.db).getStatusBySession('cs_test_read'), DatabaseError);
+});

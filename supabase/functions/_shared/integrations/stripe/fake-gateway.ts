@@ -3,6 +3,7 @@
 import {
   BillingTerminalError,
   type BillingGateway,
+  type CheckoutSessionState,
   type PaymentProof,
   type RefundResult,
   type RefundStatus,
@@ -25,6 +26,8 @@ export class FakeStripeGateway implements BillingGateway {
   nextRefundAmountCents: number | null = null;
   /** État des sessions chez Stripe : une session « complete » ne peut plus être expirée. */
   sessionStatus = new Map<string, 'open' | 'complete' | 'expired'>();
+  /** États de consultation imposés par les tests, sans mutation des preuves. */
+  checkoutStates = new Map<string, CheckoutSessionState>();
   /** Statut d'abonnement relu chez Stripe (getSubscriptionStatus). */
   subscriptionStatus = new Map<string, string>();
   canceled = new Set<string>();
@@ -65,6 +68,19 @@ export class FakeStripeGateway implements BillingGateway {
     if (!this.sessions.has(sessionId)) throw new Error('Session absente');
     const open = this.sessionStatus.get(sessionId) === 'open';
     return { sessionId, url: open ? `https://checkout.stripe.test/${sessionId}` : null };
+  }
+
+  async getCheckoutStatus(sessionId: string): Promise<CheckoutSessionState | null> {
+    const state = this.checkoutStates.get(sessionId);
+    if (state) return { ...state };
+    const proof = this.sessions.get(sessionId);
+    if (!proof) return null;
+    return {
+      sessionId, attemptId: proof.attemptId, mode: 'payment',
+      status: this.sessionStatus.get(sessionId) ?? null,
+      paymentStatus: proof.paid ? 'paid' : 'unpaid',
+      paymentIntentStatus: proof.paid ? 'succeeded' : 'processing',
+    };
   }
 
   async expireCheckoutSession(sessionId: string): Promise<SessionExpiry> {
