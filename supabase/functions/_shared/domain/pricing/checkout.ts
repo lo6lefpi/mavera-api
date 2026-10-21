@@ -3,6 +3,7 @@ import { trajetEligibility, type TrajetProfile } from "./eligibility.ts";
 import { PricingError } from "./errors.ts";
 import { type BillingOption, BOOKS_UPDATE, type PlanCode } from "./grid.ts";
 import type { Cents } from "./money.ts";
+import { quebecTaxes, TAX_REGION } from "./taxes.ts";
 import { type BillingCycle, commitmentEndsOn, cycleMonths, type GrantedTerms, grantTerms } from "./terms.ts";
 
 /**
@@ -28,20 +29,35 @@ export interface CheckoutRequest {
 
 export type CheckoutLineKind = "opening_fee" | "first_period";
 
+/** Une ligne facturée : montant avant taxes, puis TPS et TVQ calculées sur cette ligne. */
 export interface CheckoutLine {
   readonly kind: CheckoutLineKind;
   readonly amountCents: Cents;
+  readonly gstCents: Cents;
+  readonly qstCents: Cents;
 }
 
 export interface CheckoutQuote {
   readonly terms: GrantedTerms;
   /** Premier jour du premier mois couvert par le forfait (subscriptions.starts_on). */
   readonly startsOn: IsoDate;
-  /** Ce qui est payé aujourd'hui. */
-  readonly dueToday: { readonly lines: readonly CheckoutLine[]; readonly totalCents: Cents };
-  /** Prélèvement récurrent : montant, cycle et date du prochain. */
+  /** Ce qui est payé aujourd'hui. totalCents est le montant encaissé, taxes comprises. */
+  readonly dueToday: {
+    readonly lines: readonly CheckoutLine[];
+    readonly subtotalCents: Cents;
+    readonly gstCents: Cents;
+    readonly qstCents: Cents;
+    readonly totalCents: Cents;
+  };
+  /**
+   * Prélèvement récurrent : amountCents avant taxes (prix de l'abonnement),
+   * totalCents taxes comprises (ce qui est prélevé), cycle et date du prochain.
+   */
   readonly recurring: {
     readonly amountCents: Cents;
+    readonly gstCents: Cents;
+    readonly qstCents: Cents;
+    readonly totalCents: Cents;
     readonly cycle: BillingCycle;
     readonly nextChargeOn: IsoDate;
   };
@@ -52,8 +68,11 @@ export interface CheckoutQuote {
    * une mise à jour de vos livres, dont le prix part de ce minimum.
    */
   readonly currentMonthBooksUpdate: { readonly fromCents: Cents; readonly month: IsoDate } | null;
-  /** Tous les montants sont avant taxes. */
-  readonly taxesIncluded: false;
+  /**
+   * Taxes de vente appliquées (Québec : TPS et TVQ). Les prix des conditions
+   * accordées (terms) restent avant taxes.
+   */
+  readonly taxRegion: typeof TAX_REGION;
 }
 
 function assertTrajetEligible(profile: TrajetProfile | undefined): void {
@@ -62,7 +81,7 @@ function assertTrajetEligible(profile: TrajetProfile | undefined): void {
   }
   const { eligible, reasons } = trajetEligibility(profile);
   if (!eligible) {
-    throw new PricingError("not_eligible", "Ce dossier n'est pas admissible à Trajet : le forfait Départ prend le relais", reasons);
+    throw new PricingError("not_eligible", "Ce dossier n'est pas admissible à Trajet : un autre forfait s'applique", reasons);
   }
 }
 
@@ -100,22 +119,35 @@ export function quoteCheckout(request: CheckoutRequest): CheckoutQuote {
     ? startOfMonth(request.today)
     : firstOfNextMonth(request.today);
 
-  const lines: CheckoutLine[] = [{ kind: "opening_fee", amountCents: terms.openingFeeCents }];
+  const line = (kind: CheckoutLineKind, amount: Cents): CheckoutLine => {
+    const { gstCents, qstCents } = quebecTaxes(amount);
+    return { kind, amountCents: amount, gstCents, qstCents };
+  };
+  const lines: CheckoutLine[] = [line("opening_fee", terms.openingFeeCents)];
   let nextChargeOn: IsoDate;
   if (startMonth === "current") {
-    lines.push({ kind: "first_period", amountCents: terms.recurringPriceCents });
+    lines.push(line("first_period", terms.recurringPriceCents));
     nextChargeOn = addMonths(startsOn, cycleMonths(terms.billingOption));
   } else {
     // Rien d'autre aujourd'hui : le premier cycle est prélevé le 1er du mois suivant.
     nextChargeOn = startsOn;
   }
 
+  const sum = (pick: (l: CheckoutLine) => Cents) => lines.reduce((total, l) => total + pick(l), 0);
+  const subtotalCents = sum(l => l.amountCents);
+  const gstCents = sum(l => l.gstCents);
+  const qstCents = sum(l => l.qstCents);
+  const recurringTaxes = quebecTaxes(terms.recurringPriceCents);
+
   return {
     terms,
     startsOn,
-    dueToday: { lines, totalCents: lines.reduce((sum, line) => sum + line.amountCents, 0) },
+    dueToday: { lines, subtotalCents, gstCents, qstCents, totalCents: subtotalCents + gstCents + qstCents },
     recurring: {
       amountCents: terms.recurringPriceCents,
+      gstCents: recurringTaxes.gstCents,
+      qstCents: recurringTaxes.qstCents,
+      totalCents: recurringTaxes.totalCents,
       cycle: terms.cycle,
       nextChargeOn,
     },
@@ -124,6 +156,6 @@ export function quoteCheckout(request: CheckoutRequest): CheckoutQuote {
     currentMonthBooksUpdate: startMonth === "next"
       ? { fromCents: BOOKS_UPDATE.minimumCents, month: startOfMonth(request.today) }
       : null,
-    taxesIncluded: false,
+    taxRegion: TAX_REGION,
   };
 }

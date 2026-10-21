@@ -51,7 +51,7 @@ test('checkout : adresse de paiement Stripe et récapitulatif, en-tête CORS du 
   assert.equal(res.headers.get('access-control-allow-origin'), SITE);
   const data = await res.json();
   assert.match(data.url, /^https:\/\/checkout\.stripe\.test\//);
-  assert.equal(data.quote.dueToday.totalCents, 17800);
+  assert.equal(data.quote.dueToday.totalCents, 20466);
   assert.equal(stripe.checkoutCreates, 1);
 });
 
@@ -224,4 +224,8 @@ test('Turnstile : succès, échec et domaine inattendu', async () => {
   assert.equal(await new TurnstileVerifier('s', ['mavera.test'], reply({ success: false })).verify('t', null), false);
   assert.equal(await new TurnstileVerifier('s', ['mavera.test'], reply({ success: true, hostname: 'pirate.test' })).verify('t', null), false);
   assert.equal(await new TurnstileVerifier('s', [], reply({ success: true })).verify('', null), false);
+  // Clé de test Cloudflare : faux domaine accepté; jamais avec une vraie clé.
+  const testKey = '1x0000000000000000000000000000000AA';
+  assert.equal(await new TurnstileVerifier(testKey, ['localhost'], reply({ success: true, hostname: 'example.com' })).verify('t', null), true);
+  assert.equal(await new TurnstileVerifier(testKey, ['localhost'], reply({ success: false })).verify('t', null), false);
 });

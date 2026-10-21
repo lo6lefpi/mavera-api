@@ -74,7 +74,9 @@ async function main() {
   const body = await res.json();
   if (res.status !== 200) throw new Error(`public-api a répondu ${res.status} : ${JSON.stringify(body)}`);
   const quote = body.quote as CheckoutQuote;
-  console.log(`   Montant du jour : ${(quote.dueToday.totalCents / 100).toFixed(2)} $, prochain prélèvement le ${quote.recurring.nextChargeOn}`);
+  const $ = (cents: number) => `${(cents / 100).toFixed(2)} $`;
+  console.log(`   Aujourd'hui : ${$(quote.dueToday.subtotalCents)} + TPS ${$(quote.dueToday.gstCents)} + TVQ ${$(quote.dueToday.qstCents)} = ${$(quote.dueToday.totalCents)}`);
+  console.log(`   Puis ${$(quote.recurring.totalCents)} taxes comprises, à partir du ${quote.recurring.nextChargeOn}`);
   console.log(`\n2. Payez sur cette page (carte 4242 4242 4242 4242) :\n\n   ${body.url}\n`);
 
   // 2. Attendre le webhook
@@ -101,7 +103,11 @@ async function main() {
   console.log('\n3. Stripe');
   const intent = await stripe.paymentIntents.retrieve(String(attempt.stripe_payment_intent_id));
   check(intent.amount_received === quote.dueToday.totalCents && intent.currency === 'cad',
-    `Encaissé : ${(intent.amount_received / 100).toFixed(2)} $ CAD`, `attendu ${quote.dueToday.totalCents} cents`);
+    `Encaissé : ${(intent.amount_received / 100).toFixed(2)} $ CAD, taxes comprises`, `attendu ${quote.dueToday.totalCents} cents`);
+  const session = await stripe.checkout.sessions.retrieve(String(attempt.stripe_session_id));
+  check(session.total_details?.amount_tax === quote.dueToday.gstCents + quote.dueToday.qstCents,
+    `Taxes calculées par Stripe : ${$(session.total_details?.amount_tax ?? 0)}`,
+    `attendu ${quote.dueToday.gstCents + quote.dueToday.qstCents} cents`);
   const sub = await stripe.subscriptions.retrieve(String(attempt.stripe_subscription_id), { expand: ['latest_invoice'] });
   const item = sub.items.data[0];
   check(item?.price.lookup_key === quote.terms.stripeRecurringLookupKey && item?.price.unit_amount === quote.recurring.amountCents,
@@ -110,6 +116,8 @@ async function main() {
     `Premier prélèvement le ${quote.recurring.nextChargeOn} à minuit (Montréal)`,
     `ancrage reçu ${new Date(sub.billing_cycle_anchor * 1000).toISOString()}`);
   check(sub.metadata?.attempt_id === attemptId, 'Abonnement relié à la tentative');
+  const subRates = (sub.default_tax_rates ?? []).map(r => (typeof r === 'string' ? r : `${r.display_name} ${r.percentage}`)).sort();
+  check(subRates.join(',') === 'TPS 5,TVQ 9.975', 'TPS et TVQ ajoutées à chaque prélèvement', subRates.join(','));
   const invoice = sub.latest_invoice as Stripe.Invoice | null;
   check(!invoice || invoice.amount_paid === 0, 'Rien d\'autre facturé avant le premier prélèvement',
     `facture ${invoice?.id} : ${invoice?.amount_paid} cents`);

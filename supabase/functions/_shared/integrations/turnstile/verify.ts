@@ -4,6 +4,8 @@
  * session Stripe n'est créée. Un jeton ne sert qu'une fois.
  */
 const SITEVERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+/** Clés secrètes de test de Cloudflare : leur réponse porte un faux domaine (example.com). */
+const TEST_SECRET = /^[123]x0+AA$/;
 
 export interface HumanCheck {
   verify(token: string, remoteIp: string | null): Promise<boolean>;
@@ -27,6 +29,7 @@ export class TurnstileVerifier implements HumanCheck {
     if (!res.ok) throw new Error(`Turnstile indisponible (${res.status})`);
     const outcome = await res.json() as { success?: boolean; hostname?: string };
     if (outcome.success !== true) return false;
-    return !this.hostnames.length || this.hostnames.includes(outcome.hostname ?? '');
+    if (TEST_SECRET.test(this.secret) || !this.hostnames.length) return true;
+    return this.hostnames.includes(outcome.hostname ?? '');
   }
 }

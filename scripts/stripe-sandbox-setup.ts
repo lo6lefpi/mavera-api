@@ -1,5 +1,6 @@
 /**
- * Crée les prix d'abonnement dans le BAC À SABLE Stripe, à partir de domain/pricing.
+ * Crée les prix d'abonnement et les taux de taxe (TPS, TVQ) dans le BAC À SABLE
+ * Stripe, à partir de domain/pricing.
  * Aucun montant n'est recopié à la main : la grille est la seule source.
  *
  *   deno run --allow-env --allow-net --env-file=supabase/functions/.env scripts/stripe-sandbox-setup.ts
@@ -10,11 +11,14 @@
  * version de la grille (GRID_VERSION), jamais une modification en place.
  */
 import { stripeClient, type Stripe } from '../supabase/functions/_shared/integrations/stripe/client.ts';
+import { matchesDomain, TAX_RATE_SPECS } from '../supabase/functions/_shared/integrations/stripe/taxes.ts';
 import {
   type BillingOption,
   GRID_VERSION,
   grantTerms,
   PLANS,
+  QUEBEC_TAXES,
+  type TaxCode,
 } from '../supabase/functions/_shared/domain/pricing/mod.ts';
 
 export interface ExpectedPrice {
@@ -93,7 +97,34 @@ async function main() {
     }, { idempotencyKey: `setup:price:${p.lookupKey}` });
     console.log(`  + ${label}   créé (${created.id})`);
   }
-  console.log('\nTerminé. Les montants sont avant taxes (tax_behavior: exclusive).');
+  console.log('\nTaxes du Québec (taux fixes, sans Stripe Tax)');
+  const existingRates: Partial<Record<TaxCode, Stripe.TaxRate[]>> = {};
+  for await (const rate of stripe.taxRates.list({ active: true, limit: 100 })) {
+    const code = rate.metadata?.tax_code as TaxCode | undefined;
+    if (code === 'gst' || code === 'qst') (existingRates[code] ??= []).push(rate);
+  }
+  for (const code of ['gst', 'qst'] as const) {
+    const spec = TAX_RATE_SPECS[code];
+    const label = `${spec.display_name.padEnd(24)} ${String(QUEBEC_TAXES[code].percent).padStart(8)} %`;
+    const found = existingRates[code] ?? [];
+    if (found.length > 1) throw new Error(`Plusieurs taux ${spec.display_name} actifs : en désactiver un dans Stripe`);
+    if (found[0]) {
+      if (!matchesDomain(found[0], code)) {
+        throw new Error(`Le taux ${spec.display_name} (${found[0].id}) diffère de domain/pricing : le désactiver dans Stripe, puis relancer.`);
+      }
+      console.log(`  ✓ ${label}   déjà présent (${found[0].id})`);
+      continue;
+    }
+    if (dryRun) { console.log(`  + ${label}   à créer`); continue; }
+    const created = await stripe.taxRates.create({
+      display_name: spec.display_name, tax_type: spec.tax_type, percentage: QUEBEC_TAXES[code].percent,
+      inclusive: false, country: 'CA', state: 'QC', jurisdiction: 'Québec',
+      metadata: { tax_code: code },
+    }, { idempotencyKey: `setup:tax-rate:${code}:${QUEBEC_TAXES[code].percent}` });
+    console.log(`  + ${label}   créé (${created.id})`);
+  }
+
+  console.log('\nTerminé. Les prix sont avant taxes (tax_behavior: exclusive); TPS et TVQ s\'ajoutent.');
 }
 
 if (import.meta.main) {

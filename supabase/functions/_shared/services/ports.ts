@@ -113,7 +113,8 @@ export interface BillingGateway {
   createCheckoutSession(input: {
     attemptId: string;
     email: string;
-    lines: ReadonlyArray<{ label: string; amountCents: number }>;
+    /** Montants avant taxes, avec la TPS et la TVQ calculées par domain/pricing pour chaque ligne. */
+    lines: ReadonlyArray<{ label: string; amountCents: number; gstCents: number; qstCents: number }>;
     successUrl: string;
     cancelUrl: string;
     /** Date du prochain prélèvement (quote.recurring.nextChargeOn) : la session expire avant. */
@@ -129,6 +130,7 @@ export interface BillingGateway {
     customerId: string;
     paymentMethodId: string;
     recurringLookupKey: string;
+    /** Prix avant taxes; la TPS et la TVQ s'ajoutent à chaque prélèvement. */
     recurringPriceCents: number;
     cycle: 'month' | 'year';
     anchorOn: IsoDate;

@@ -1,7 +1,7 @@
 import { invalid } from "./errors.ts";
 
 /**
- * Montant en cents entiers, avant taxes. Jamais de nombre à virgule :
+ * Montant en cents entiers (avant taxes, sauf indication). Jamais de nombre à virgule :
  * 4,50 $ s'écrit 450.
  */
 export type Cents = number;

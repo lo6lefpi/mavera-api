@@ -23,7 +23,7 @@ const signupError = (code: string) => (error: unknown) => error instanceof Signu
 test('prix mensuel courant fourni par pricing, aucun recalcul Stripe', async () => {
   const repo = new FakeRepository(); const stripe = new FakeStripeGateway();
   const result = await startCheckout(input(), { repository: repo, billing: stripe }, '2026-10-31');
-  assert.equal(result.quote.dueToday.totalCents, 17800);
+  assert.equal(result.quote.dueToday.totalCents, 20466);   // 178 $ + TPS 8,90 $ + TVQ 17,76 $
   assert.equal(result.quote.recurring.nextChargeOn, '2026-11-01');
   assert.equal(result.quote.terms.stripeRecurringLookupKey, 'depart_monthly_2026_10');
   assert.equal(result.quote.dueToday.lines.length, 2);
@@ -31,7 +31,7 @@ test('prix mensuel courant fourni par pricing, aucun recalcul Stripe', async () 
 
 test('mois suivant : frais d’ouverture uniquement, prélèvement 1er prochain', () => {
   const quote = prepareQuote(input({ startMonth: 'next' }), '2026-10-20');
-  assert.equal(quote.dueToday.totalCents, 9900);
+  assert.equal(quote.dueToday.totalCents, 11383);   // ouverture 99 $ + taxes
   assert.equal(quote.recurring.nextChargeOn, '2026-11-01');
   assert.equal(quote.currentMonthBooksUpdate?.fromCents, 12000);
 });
@@ -75,7 +75,7 @@ test('client refusé après paiement : remboursement sans abonnement', async () 
 
 test('annuel renouvelé 12 mois plus tard, et Trajet sans annuel', () => {
   const quote = prepareQuote(input({ planCode:'envol', billingOption:'annual' }), '2026-10-20');
-  assert.equal(quote.dueToday.totalCents, 258900);
+  assert.equal(quote.dueToday.totalCents, 297671);  // 99 $ + 2 490 $ + TPS 129,45 $ + TVQ 258,26 $
   assert.equal(quote.recurring.nextChargeOn, '2027-10-01');
   assert.equal(quote.terms.stripeRecurringLookupKey, 'envol_annual_2026_10');
   assert.throws(() => prepareQuote(input({ planCode:'trajet', billingOption:'annual' }), '2026-10-20'));
@@ -190,7 +190,7 @@ test('ancien client détecté au paiement, ou paiement après abandon : rembours
   repo2.attempts.get(input().attemptId)!.abandonedAt = new Date().toISOString();
   assert.equal(await completeCheckout(input().attemptId, 'evt_ab', deps(repo2, stripe2)), 'rejected');
   assert.equal(repo2.reasons.get(input().attemptId), 'paye_apres_abandon');
-  assert.equal(stripe2.refunds.get(input().attemptId)!.amountCents, 17800);
+  assert.equal(stripe2.refunds.get(input().attemptId)!.amountCents, 20466);
   assert.equal(stripe2.subscriptionCreates, 0);
   assert.equal(stripe.subscriptionCreates, 0);
 });

@@ -6,7 +6,7 @@ Jamais de clé de production : les scripts refusent toute clé qui ne commence p
 
 1. Copier `supabase/functions/.env.example` en `supabase/functions/.env` et remplir
    `STRIPE_SECRET_KEY` (bac à sable), `PUBLIC_SITE_ORIGIN`, et `CAPTCHA_DISABLED=true` en local.
-2. Créer les prix d'abonnement (une seule fois par grille; sans danger à relancer) :
+2. Créer les prix d'abonnement et les taux de TPS et de TVQ (une seule fois par grille; sans danger à relancer) :
    `deno run --allow-env --allow-net --env-file=supabase/functions/.env scripts/stripe-sandbox-setup.ts`
 3. Trois terminaux :
    - `supabase start` puis `supabase functions serve`

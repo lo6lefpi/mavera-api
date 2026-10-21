@@ -51,7 +51,8 @@ export class FakeStripeGateway implements BillingGateway {
         sessionId: id, attemptId: input.attemptId,
         customerId: `cus_${++this.seq}`,
         paymentIntentId: `pi_${input.attemptId}`, paymentMethodId: `pm_${input.attemptId}`,
-        amountPaidCents: input.lines.reduce((sum, line) => sum + line.amountCents, 0),
+        // Comme Stripe : montant de chaque ligne plus ses taxes.
+        amountPaidCents: input.lines.reduce((sum, line) => sum + line.amountCents + line.gstCents + line.qstCents, 0),
         currency: 'cad', paid: this.nextPaid,
         paidAt: this.nextPaid ? (this.paidAt ?? new Date(this.now() * 1000).toISOString()) : null,
       });

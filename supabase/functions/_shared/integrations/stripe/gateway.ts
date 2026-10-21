@@ -13,6 +13,7 @@ import {
 } from '../../services/ports.ts';
 import { stripeClient, type Stripe } from './client.ts';
 import { productIdOf, resolveRecurringPrice } from './prices.ts';
+import { quebecTaxRateIds } from './taxes.ts';
 import { checkoutExpiresAt, nextAnchor, torontoMidnight } from './time.ts';
 
 const nowSeconds = (): number => Math.floor(Date.now() / 1000);
@@ -29,6 +30,7 @@ export class StripeGateway implements BillingGateway {
   async createCheckoutSession(input: Parameters<BillingGateway['createCheckoutSession']>[0]) {
     // Avant toute création : la session doit expirer avant le prélèvement du 1er.
     const expiresAt = checkoutExpiresAt(input.payBefore, nowSeconds());
+    const taxRates = await quebecTaxRateIds(this.stripe);
     const session = await this.stripe.checkout.sessions.create({
       mode: 'payment',
       currency: 'cad',
@@ -47,13 +49,24 @@ export class StripeGateway implements BillingGateway {
       // Débit préautorisé (ACSS) : seulement après validation du paiement asynchrone en bac à sable.
       payment_method_types: ['card'],
       line_items: input.lines.map(line => ({
-        price_data: { currency: 'cad', product_data: { name: line.label }, unit_amount: line.amountCents },
+        price_data: {
+          currency: 'cad', product_data: { name: line.label }, unit_amount: line.amountCents,
+          tax_behavior: 'exclusive' as const,
+        },
         quantity: 1,
+        // TPS et TVQ ajoutées par Stripe sur chaque ligne, avec les taux fixes du Québec.
+        tax_rates: taxRates,
       })),
       success_url: input.successUrl,
       cancel_url: input.cancelUrl,
     }, { idempotencyKey: `checkout:create:${input.attemptId}` });
     if (!session.url) throw new Error('Stripe ne fournit aucune adresse de paiement');
+    // Le total calculé par Stripe doit être exactement celui du récapitulatif, avant que le client paie.
+    const expected = input.lines.reduce((sum, l) => sum + l.amountCents + l.gstCents + l.qstCents, 0);
+    if (session.amount_total !== expected) {
+      await this.stripe.checkout.sessions.expire(session.id).catch(() => undefined);
+      throw new Error(`Total Stripe ${session.amount_total} différent du récapitulatif ${expected} : session annulée`);
+    }
     return { sessionId: session.id, url: session.url };
   }
 
@@ -135,6 +148,7 @@ export class StripeGateway implements BillingGateway {
     const price = await resolveRecurringPrice(
       this.stripe, input.recurringLookupKey, input.recurringPriceCents, input.cycle,
     );
+    const taxRates = await quebecTaxRateIds(this.stripe);
     const now = nowSeconds();
     const paidAt = Math.floor(Date.parse(input.paidAt) / 1000);
     if (!Number.isFinite(paidAt)) throw new Error('Date de paiement manquante');
@@ -156,6 +170,8 @@ export class StripeGateway implements BillingGateway {
     const sub = await this.stripe.subscriptions.create({
       customer: input.customerId,
       items: [{ price: price.id }],
+      // TPS et TVQ ajoutées à chaque prélèvement.
+      default_tax_rates: taxRates,
       default_payment_method: input.paymentMethodId,
       collection_method: 'charge_automatically',
       billing_cycle_anchor: torontoMidnight(anchorOn),
@@ -165,6 +181,7 @@ export class StripeGateway implements BillingGateway {
           add_invoice_items: [{
             price_data: { currency: 'cad', product: productIdOf(price), unit_amount: input.recurringPriceCents },
             metadata: { attempt_id: input.attemptId, cycle_starting: missedCycles[0] },
+            tax_rates: taxRates,
           }],
         }
         : {}),

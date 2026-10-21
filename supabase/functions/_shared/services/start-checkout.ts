@@ -64,11 +64,15 @@ export async function startCheckout(
   const quote = existing?.quote ?? prepareQuote(normalizedInput, today);
   const lines = quote.dueToday.lines.map(line => ({
     label: line.kind === 'opening_fee' ? 'Ouverture du dossier' : 'Première période de tenue de livres',
-    amountCents: line.amountCents,
+    amountCents: line.amountCents, gstCents: line.gstCents, qstCents: line.qstCents,
   }));
-  if (lines.length === 0 || lines.some(line => !Number.isSafeInteger(line.amountCents) || line.amountCents < 0) ||
-      lines.reduce((sum, line) => sum + line.amountCents, 0) !== quote.dueToday.totalCents ||
-      quote.dueToday.totalCents <= 0) throw new Error('Récapitulatif invalide');
+  const cents = (n: number) => Number.isSafeInteger(n) && n >= 0;
+  const sum = (pick: (l: typeof lines[number]) => number) => lines.reduce((total, l) => total + pick(l), 0);
+  const d = quote.dueToday;
+  if (lines.length === 0 || lines.some(l => !cents(l.amountCents) || !cents(l.gstCents) || !cents(l.qstCents)) ||
+      sum(l => l.amountCents) !== d.subtotalCents || sum(l => l.gstCents) !== d.gstCents ||
+      sum(l => l.qstCents) !== d.qstCents || d.subtotalCents + d.gstCents + d.qstCents !== d.totalCents ||
+      d.totalCents <= 0) throw new Error('Récapitulatif invalide');
   if (!existing) await deps.repository.createAttempt(normalizedInput, quote, fingerprint);
   // Toujours un nouveau client Stripe : jamais celui d'un dossier retrouvé par courriel.
   const result = await deps.billing.createCheckoutSession({

@@ -2,7 +2,8 @@
  * domain/pricing — seule source des prix de l'entreprise.
  *
  * Aucune dépendance (ni Supabase, ni Stripe, ni réseau) : tout se teste
- * hors ligne. Les montants sont des cents entiers, avant taxes.
+ * hors ligne. Les montants sont des cents entiers, avant taxes, sauf les
+ * totaux taxes comprises du récapitulatif de paiement (TPS et TVQ, taxes.ts).
  *
  * Qui l'utilise :
  * - public-api : aperçu du prix (quoteCheckout, qui vérifie aussi
@@ -45,7 +46,8 @@ export {
   openingFee,
   recurringPrice,
 } from "./terms.ts";
-export { type CheckoutQuote, type CheckoutRequest, quoteCheckout, type StartMonth } from "./checkout.ts";
+export { hasHalfCentTax, QUEBEC_TAXES, quebecTaxes, TAX_REGION, type TaxCode, type TaxedAmount } from "./taxes.ts";
+export { type CheckoutLine, type CheckoutQuote, type CheckoutRequest, quoteCheckout, type StartMonth } from "./checkout.ts";
 export { countMonth, type MonthlyCount, type PlanPeriod, type QuotaTerms, termsForMonth } from "./overage.ts";
 export {
   type CurrentSubscription,
