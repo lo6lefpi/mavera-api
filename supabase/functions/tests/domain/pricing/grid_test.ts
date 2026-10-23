@@ -15,7 +15,7 @@ const NBSP = " ";
 Deno.test("grille : prix et quotas décidés en octobre 2026", () => {
   const rows = Object.values(PLANS).map((p) => [p.code, p.monthlyCents, p.includedTransactions, p.includedAccounts]);
   assertEquals(rows, [
-    ["trajet", 4900, 15, 1],
+    ["trajet", 5900, 20, 2],
     ["depart", 7900, 20, 2],
     ["elan", 14900, 50, 3],
     ["envol", 24900, 100, 5],
@@ -38,7 +38,7 @@ Deno.test("grille : frais d'ouverture complets et à moitié prix", () => {
   assertEquals(grantTerms("elan", "annual").openingFeeCents, 7500);
   assertEquals(grantTerms("envol", "monthly").openingFeeCents, 19900);
   assertEquals(grantTerms("envol", "monthly_commitment").openingFeeCents, 9900);
-  assertEquals(grantTerms("trajet", "monthly").openingFeeCents, 4900);
+  assertEquals(grantTerms("trajet", "monthly").openingFeeCents, 5900);
 });
 
 Deno.test("grille : QuickBooks inclus seulement pour Trajet et Départ", () => {
@@ -48,7 +48,7 @@ Deno.test("grille : QuickBooks inclus seulement pour Trajet et Départ", () => {
 
 Deno.test("conditions accordées : instantané complet pour la base et Stripe", () => {
   assertEquals(grantTerms("elan", "annual"), {
-    gridVersion: "2026-10",
+    gridVersion: "2026-10-21",
     planCode: "elan",
     billingOption: "annual",
     cycle: "year",
@@ -62,12 +62,12 @@ Deno.test("conditions accordées : instantané complet pour la base et Stripe", 
     quickbooksIncluded: false,
     openingFeeCents: 7500,
     openingDiscountCents: 7400,
-    stripeRecurringLookupKey: "elan_annual_2026_10",
+    stripeRecurringLookupKey: "elan_annual_2026_10_21",
   });
   const monthly = grantTerms("depart", "monthly");
-  assertEquals(monthly.stripeRecurringLookupKey, "depart_monthly_2026_10");
+  assertEquals(monthly.stripeRecurringLookupKey, "depart_monthly_2026_10_21");
   // Le mensuel avec engagement utilise le même prix récurrent que le mensuel.
-  assertEquals(grantTerms("depart", "monthly_commitment").stripeRecurringLookupKey, "depart_monthly_2026_10");
+  assertEquals(grantTerms("depart", "monthly_commitment").stripeRecurringLookupKey, "depart_monthly_2026_10_21");
 });
 
 Deno.test("conditions accordées : rabais d'ouverture selon l'option", () => {

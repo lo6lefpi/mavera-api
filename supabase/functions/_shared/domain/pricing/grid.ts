@@ -10,7 +10,7 @@ import type { Cents } from "./money.ts";
  *
  * Tous les montants sont en cents, avant taxes.
  */
-export const GRID_VERSION = "2026-10";
+export const GRID_VERSION = "2026-10-21";
 
 export type PlanCode = "trajet" | "depart" | "elan" | "envol" | "sur_mesure";
 export type StandardPlanCode = Exclude<PlanCode, "sur_mesure">;
@@ -50,17 +50,17 @@ export interface PlanPricing {
 const ALL_OPTIONS: readonly BillingOption[] = ["monthly", "monthly_commitment", "annual"];
 
 export const PLANS: Readonly<Record<StandardPlanCode, PlanPricing>> = {
-  // Trajet : au mois seulement, sans engagement ni paiement annuel (20 oct. 2026).
+  // Trajet : au mois seulement, sans engagement ni paiement annuel (21 oct. 2026).
   trajet: {
     code: "trajet",
     name: "Trajet",
     rank: 1,
-    monthlyCents: 4900,
+    monthlyCents: 5900,
     annualCents: null,
-    includedTransactions: 15,
-    includedAccounts: 1,
+    includedTransactions: 20,
+    includedAccounts: 2,
     includedFilingFrequency: "annual",
-    openingFee: { fullCents: 4900, reducedCents: null },
+    openingFee: { fullCents: 5900, reducedCents: null },
     billingOptions: ["monthly"],
     quickbooksIncluded: true,
     suggestedBySimulator: false,

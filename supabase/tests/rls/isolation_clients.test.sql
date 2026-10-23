@@ -23,16 +23,16 @@ grant select, insert on ids to authenticated, anon;
 insert into ids select 'A', public.handle_checkout_completed(
   'evt_A', 'Alice@Exemple.ca', 'Alice inc.', 'depart', 'monthly_commitment', '2026-10-01',
   'cus_A', 'sub_A', 'active', true, false, 15, now() + interval '7 days',
-  7900, 20, 450, 4900, 'depart_monthly_2026_10', 5000, '2026-10', 2, 'annual', true, 1500, 2500);
+  7900, 20, 450, 4900, 'depart_monthly_2026_10_21', 5000, '2026-10-21', 2, 'annual', true, 1500, 2500);
 insert into ids select 'B', public.handle_checkout_completed(
   'evt_B', 'bruno@exemple.ca', 'Bruno Transport', 'trajet', 'monthly', '2026-10-01',
   'cus_B', 'sub_B', 'active', true, false, 10, now() + interval '7 days',
-  4900, 15, 450, 4900, 'trajet_monthly_2026_10', 0, '2026-10', 1, 'annual', true, 1500, 2500);
+  5900, 20, 450, 5900, 'trajet_monthly_2026_10_21', 0, '2026-10-21', 2, 'annual', true, 1500, 2500);
 
 select is(public.handle_checkout_completed(
   'evt_A', 'alice@exemple.ca', 'Alice inc.', 'depart', 'monthly', '2026-10-01',
   'cus_A2', 'sub_A2', 'active', true, false, 15, now() + interval '7 days',
-  7900, 20, 450, 9900, 'depart_monthly_2026_10', 0, '2026-10', 2, 'annual', true, 1500, 2500),
+  7900, 20, 450, 9900, 'depart_monthly_2026_10_21', 0, '2026-10-21', 2, 'annual', true, 1500, 2500),
   null, 'Stripe : un événement reçu deux fois ne crée pas un deuxième client');
 
 select throws_ok(
@@ -269,7 +269,7 @@ select throws_ok(
   $$ insert into public.subscription_plan_periods (subscription_id, plan_code, effective_from,
        recurring_price_cents, included_transactions, extra_transaction_cents, stripe_price_id,
        grid_version, included_accounts, included_filing_frequency, quickbooks_included, extra_account_cents, extra_filing_cents)
-     select id, 'elan', '2026-10-15', 14900, 50, 450, 'elan_monthly_2026_10', '2026-10', 3, 'quarterly', false, 1500, 2500 from public.subscriptions where stripe_subscription_id = 'sub_B' $$,
+     select id, 'elan', '2026-10-15', 14900, 50, 450, 'elan_monthly_2026_10_21', '2026-10-21', 3, 'quarterly', false, 1500, 2500 from public.subscriptions where stripe_subscription_id = 'sub_B' $$,
   '23P01', null, 'Forfaits : deux périodes ne se chevauchent pas');
 
 -- Privilèges des fonctions (y compris celles créées par de futures migrations)

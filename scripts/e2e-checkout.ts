@@ -15,7 +15,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.117.2';
 import { Stripe, STRIPE_API_VERSION } from '../supabase/functions/_shared/integrations/stripe/client.ts';
 import { torontoMidnight } from '../supabase/functions/_shared/integrations/stripe/time.ts';
-import type { CheckoutQuote } from '../supabase/functions/_shared/domain/pricing/mod.ts';
+import { type CheckoutQuote, quoteCheckout } from '../supabase/functions/_shared/domain/pricing/mod.ts';
 import type { SignupInput } from '../supabase/functions/_shared/services/ports.ts';
 import {
   BANK_ACCOUNTS, createBankCheckout, type E2EContext, e2eFetch, E2E_NETWORK_TIMEOUT_MS, type Scenario, verifyBank, verifyRejected,
@@ -74,7 +74,7 @@ async function main(mode: Scenario) {
     planCode, billingOption, startMonth, booksUpToDate: true, usesQuickbooks: false,
     estimatedTransactions: 12,
     ...(planCode === 'trajet'
-      ? { trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 12 } }
+      ? { trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 2 } }
       : {}),
     successUrl: `${site}/commencer/confirmation`, cancelUrl: `${site}/forfaits`,
     captchaToken: Deno.env.get('E2E_CAPTCHA_TOKEN') ?? 'XXXX.DUMMY.TOKEN.XXXX',
@@ -93,6 +93,13 @@ async function main(mode: Scenario) {
     if (res.status !== 200) throw new Error(`public-api a répondu ${res.status} : ${JSON.stringify(body)}`);
   }
   const quote = body.quote as CheckoutQuote;
+  const expected = quoteCheckout({ ...signup,
+    today: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto' }).format(new Date()),
+  });
+  check(quote.dueToday.totalCents === expected.dueToday.totalCents &&
+    quote.recurring.totalCents === expected.recurring.totalCents &&
+    Object.entries(expected.terms).every(([key, value]) => quote.terms[key as keyof typeof quote.terms] === value),
+    'Récapitulatif conforme à la grille locale en vigueur', `attendu ${expected.dueToday.totalCents} cents aujourd’hui`);
   const $ = (cents: number) => `${(cents / 100).toFixed(2)} $`;
   console.log(`   Aujourd'hui : ${$(quote.dueToday.subtotalCents)} + TPS ${$(quote.dueToday.gstCents)} + TVQ ${$(quote.dueToday.qstCents)} = ${$(quote.dueToday.totalCents)}`);
   console.log(`   Puis ${$(quote.recurring.totalCents)} taxes comprises, à partir du ${quote.recurring.nextChargeOn}`);

@@ -9,6 +9,8 @@
  * Sans danger à relancer : un prix déjà présent et identique est gardé. Un prix
  * présent mais différent arrête le script : changer un prix demande une nouvelle
  * version de la grille (GRID_VERSION), jamais une modification en place.
+ * La grille 2026-10-21 crée notamment trajet_monthly_2026_10_21; les anciens
+ * prix restent disponibles pour les conditions déjà accordées.
  */
 import { stripeClient, type Stripe } from '../supabase/functions/_shared/integrations/stripe/client.ts';
 import { matchesDomain, TAX_RATE_SPECS } from '../supabase/functions/_shared/integrations/stripe/taxes.ts';

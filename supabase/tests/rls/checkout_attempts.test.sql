@@ -12,15 +12,15 @@ select plan(47);
 create temp table q (k text primary key, v jsonb) on commit drop;
 grant select on q to authenticated;
 insert into q values
-  ('elan',   '{"terms":{"gridVersion":"2026-10","planCode":"elan","billingOption":"monthly_commitment","cycle":"month","recurringPriceCents":14900,"includedTransactions":50,"extraTransactionCents":450,"includedAccounts":3,"extraAccountCents":1500,"includedFilingFrequency":"quarterly","extraFilingCents":2500,"quickbooksIncluded":false,"openingFeeCents":7500,"openingDiscountCents":7400,"stripeRecurringLookupKey":"elan_monthly_2026_10"},"startsOn":"2026-10-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":7500,"gstCents":375,"qstCents":748},{"kind":"first_period","amountCents":14900,"gstCents":745,"qstCents":1486}],"subtotalCents":22400,"gstCents":1120,"qstCents":2234,"totalCents":25754},"recurring":{"amountCents":14900,"gstCents":745,"qstCents":1486,"totalCents":17131,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":"2027-10-01","extraTransactionCents":450,"currentMonthBooksUpdate":null,"taxRegion":"QC"}'),
-  ('trajet', '{"terms":{"gridVersion":"2026-10","planCode":"trajet","billingOption":"monthly","cycle":"month","recurringPriceCents":4900,"includedTransactions":15,"extraTransactionCents":450,"includedAccounts":1,"extraAccountCents":1500,"includedFilingFrequency":"annual","extraFilingCents":2500,"quickbooksIncluded":true,"openingFeeCents":4900,"openingDiscountCents":0,"stripeRecurringLookupKey":"trajet_monthly_2026_10"},"startsOn":"2026-11-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":4900,"gstCents":245,"qstCents":489}],"subtotalCents":4900,"gstCents":245,"qstCents":489,"totalCents":5634},"recurring":{"amountCents":4900,"gstCents":245,"qstCents":489,"totalCents":5634,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":null,"extraTransactionCents":450,"currentMonthBooksUpdate":{"fromCents":12000,"month":"2026-10-01"},"taxRegion":"QC"}');
+  ('elan',   '{"terms":{"gridVersion":"2026-10-21","planCode":"elan","billingOption":"monthly_commitment","cycle":"month","recurringPriceCents":14900,"includedTransactions":50,"extraTransactionCents":450,"includedAccounts":3,"extraAccountCents":1500,"includedFilingFrequency":"quarterly","extraFilingCents":2500,"quickbooksIncluded":false,"openingFeeCents":7500,"openingDiscountCents":7400,"stripeRecurringLookupKey":"elan_monthly_2026_10_21"},"startsOn":"2026-10-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":7500,"gstCents":375,"qstCents":748},{"kind":"first_period","amountCents":14900,"gstCents":745,"qstCents":1486}],"subtotalCents":22400,"gstCents":1120,"qstCents":2234,"totalCents":25754},"recurring":{"amountCents":14900,"gstCents":745,"qstCents":1486,"totalCents":17131,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":"2027-10-01","extraTransactionCents":450,"currentMonthBooksUpdate":null,"taxRegion":"QC"}'),
+  ('trajet', '{"terms":{"gridVersion":"2026-10-21","planCode":"trajet","billingOption":"monthly","cycle":"month","recurringPriceCents":5900,"includedTransactions":20,"extraTransactionCents":450,"includedAccounts":2,"extraAccountCents":1500,"includedFilingFrequency":"annual","extraFilingCents":2500,"quickbooksIncluded":true,"openingFeeCents":5900,"openingDiscountCents":0,"stripeRecurringLookupKey":"trajet_monthly_2026_10_21"},"startsOn":"2026-11-01","dueToday":{"lines":[{"kind":"opening_fee","amountCents":5900,"gstCents":295,"qstCents":589}],"subtotalCents":5900,"gstCents":295,"qstCents":589,"totalCents":6784},"recurring":{"amountCents":5900,"gstCents":295,"qstCents":589,"totalCents":6784,"cycle":"month","nextChargeOn":"2026-11-01"},"commitmentEndsOn":null,"extraTransactionCents":450,"currentMonthBooksUpdate":{"fromCents":12000,"month":"2026-10-01"},"taxRegion":"QC"}');
 -- 1. Récapitulatif complet et cohérent, vérifié avant le paiement
 select ok(private.is_valid_checkout_quote((select v from q where k = 'elan')), 'Récapitulatif du domaine : valide');
 select ok(private.is_valid_checkout_quote((select v from q where k = 'trajet')), 'Trajet, mois suivant : valide');
 select ok(not private.is_valid_checkout_quote((select v #- '{terms,includedAccounts}' from q where k = 'elan')), 'Clé absente : invalide, jamais « inconnu »');
 select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{dueToday,totalCents}', '22500') from q where k = 'elan')), 'Total différent de la somme des lignes : invalide');
 select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{recurring,amountCents}', '7900') from q where k = 'elan')), 'Montant récurrent différent du prix accordé : invalide');
-select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{terms,stripeRecurringLookupKey}', '"depart_monthly_2026_10"') from q where k = 'elan')), 'Clé Stripe d''un autre forfait : invalide');
+select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{terms,stripeRecurringLookupKey}', '"depart_monthly_2026_10_21"') from q where k = 'elan')), 'Clé Stripe d''un autre forfait : invalide');
 select ok(not private.is_valid_checkout_quote((select jsonb_set(jsonb_set(v, '{terms,billingOption}', '"annual"'), '{terms,cycle}', '"year"') from q where k = 'trajet')), 'Trajet à l''année : invalide');
 select ok(not private.is_valid_checkout_quote((select jsonb_set(v, '{recurring,nextChargeOn}', '"2026-12-01"') from q where k = 'elan')), 'Prochain prélèvement incohérent : invalide');
 select throws_ok($$ select public.checkout_attempt_create('a0000000-0000-4000-8000-000000000001', 'x@exemple.ca', '514', 'X',
@@ -48,7 +48,7 @@ select is((select pp.plan_code || '/' || pp.recurring_price_cents || '/' || pp.i
                   s.opening_fee_cents || '/' || s.opening_discount_cents
            from public.subscription_plan_periods pp join public.subscriptions s on s.id = pp.subscription_id
            where s.stripe_subscription_id = 'sub_elise'),
-  'elan/14900/3/quarterly/false/2026-10/7500/7400', 'Toutes les conditions accordées sont enregistrées');
+  'elan/14900/3/quarterly/false/2026-10-21/7500/7400', 'Toutes les conditions accordées sont enregistrées');
 select is(public.checkout_attempt_finish('a1111111-1111-4111-8111-111111111111', 'b1111111-1111-4111-8111-111111111111', 'evt_elise_bis', now() + interval '7 days'),
   (select m.client_id from public.mandates m join public.subscriptions s on s.mandate_id = m.id where s.stripe_subscription_id = 'sub_elise'),
   'Webhook rejoué : même dossier, aucun doublon');
@@ -77,12 +77,12 @@ select is((select completed_at from public.checkout_attempts where id = 'a555555
 select public.checkout_attempt_create('a2222222-2222-4222-8222-222222222222', 'tom@exemple.ca', '438 555 0102', 'Tom Livraison', true, false, 12, (select v from q where k = 'trajet'));
 select public.checkout_attempt_save_session('a2222222-2222-4222-8222-222222222222', 'cs_test_tom');
 select public.checkout_attempt_claim('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111');
-select public.checkout_attempt_paid('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'cs_test_tom', 'cus_tom', 'pi_tom', 'pm_tom', 5634);
+select public.checkout_attempt_paid('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'cs_test_tom', 'cus_tom', 'pi_tom', 'pm_tom', 6784);
 select throws_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 2000, 'succeeded', 'inscription_refused') $$,
   'P0001', null, 'Remboursement partiel : refus non enregistré');
-select throws_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 5634, 'failed', 'inscription_refused') $$,
+select throws_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 6784, 'failed', 'inscription_refused') $$,
   'P0001', null, 'Remboursement refusé par Stripe : refus non enregistré');
-select lives_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 5634, 'pending', 'inscription_refused') $$,
+select lives_ok($$ select public.checkout_attempt_reject('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 're_tom', 6784, 'pending', 'inscription_refused') $$,
   'Remboursement complet en cours : refus enregistré');
 select throws_ok($$ select public.checkout_attempt_finish('a2222222-2222-4222-8222-222222222222', 'c1111111-1111-4111-8111-111111111111', 'evt_tom', now() + interval '7 days') $$,
   'P0001', null, 'Tentative refusée : jamais de dossier');
@@ -94,10 +94,10 @@ select lives_ok($$ select public.checkout_attempt_abandon('a3333333-3333-4333-83
 select lives_ok($$ select public.checkout_attempt_create('a4444444-4444-4444-8444-444444444444', 'ana@exemple.ca', '450 555 0103', 'Ana', true, false, 10, (select v from q where k = 'trajet')) $$,
   'Après l''abandon, une nouvelle inscription est possible');
 select public.checkout_attempt_claim('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111');
-select public.checkout_attempt_paid('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 'cs_test_ana', 'cus_ana', 'pi_ana', 'pm_ana', 5634);
+select public.checkout_attempt_paid('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 'cs_test_ana', 'cus_ana', 'pi_ana', 'pm_ana', 6784);
 select throws_ok($$ select public.checkout_attempt_subscription('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 'sub_ana', 'price_trajet', 'active') $$,
   'P0001', null, 'Payée après l''abandon : jamais d''abonnement');
-select lives_ok($$ select public.checkout_attempt_reject('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 're_ana', 5634, 'succeeded', 'paid_after_abandon') $$,
+select lives_ok($$ select public.checkout_attempt_reject('a3333333-3333-4333-8333-333333333333', 'd1111111-1111-4111-8111-111111111111', 're_ana', 6784, 'succeeded', 'paid_after_abandon') $$,
   'Payée après l''abandon : remboursée');
 update public.checkout_attempts set created_at = now() - interval '25 hours' where id = 'a4444444-4444-4444-8444-444444444444';
 select throws_ok($$ select public.checkout_attempt_create('a6666666-6666-4666-8666-666666666666', 'ana@exemple.ca',
@@ -141,7 +141,7 @@ update public.checkout_attempts set rejected_at = now() - interval '91 days' whe
 select is((select deleted_unpaid || '/' || deleted_completed || '/' || anonymized_refused from public.purge_checkout_attempts()),
   '1/1/1', 'Purge : non payées et terminées supprimées, refusée remboursée anonymisée');
 select is((select email || '/' || refund_amount_cents from public.checkout_attempts where id = 'a3333333-3333-4333-8333-333333333333'),
-  'efface+a3333333-3333-4333-8333-333333333333@invalid/5634', 'Refusée : coordonnées effacées, montant remboursé gardé');
+  'efface+a3333333-3333-4333-8333-333333333333@invalid/6784', 'Refusée : coordonnées effacées, montant remboursé gardé');
 select is((select email from public.checkout_attempts where id = 'a2222222-2222-4222-8222-222222222222'), 'tom@exemple.ca',
   'Remboursement en échec : rien n''est effacé tant que ce n''est pas réglé');
 select isnt((select id from public.checkout_attempts where id = 'a5555555-5555-4555-8555-555555555555'), null, 'Payée sans dossier : jamais purgée');

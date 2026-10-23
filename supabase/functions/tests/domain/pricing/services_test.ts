@@ -98,8 +98,8 @@ Deno.test("TPS/TVQ seule : 75 $", () => {
 Deno.test("comptes : 15 $ par mois au-delà des comptes inclus", () => {
   assertEquals(extraAccounts(terms.depart, 4), { includedAccounts: 2, extraAccounts: 2, unitMonthlyCents: 1500, monthlyCents: 3000 });
   assertEquals(extraAccounts(terms.envol, 5).monthlyCents, 0);
-  assertEquals(extraAccounts(terms.trajet, 1).monthlyCents, 0);
-  assertEquals(assertThrows(() => extraAccounts(terms.trajet, 2), PricingError).code, "not_eligible");
+  assertEquals(extraAccounts(terms.trajet, 2).monthlyCents, 0);
+  assertEquals(assertThrows(() => extraAccounts(terms.trajet, 3), PricingError).code, "not_eligible");
 });
 
 Deno.test("options : prix unitaires connus, factures clients sans prix fixe", () => {
@@ -170,10 +170,21 @@ Deno.test("simulateur : ne suggère jamais Trajet", () => {
 });
 
 Deno.test("Trajet : admissibilité et raisons d'un refus", () => {
-  const ok = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false, monthlyTransactions: 15 };
+  const ok = { platformIncomeOnly: true, accounts: 2, issuesClientInvoices: false };
   assertEquals(trajetEligibility(ok), { eligible: true, reasons: [] });
   assertEquals(
-    trajetEligibility({ platformIncomeOnly: false, accounts: 2, issuesClientInvoices: true, monthlyTransactions: 16 }).reasons,
-    ["other_income", "too_many_accounts", "client_invoices", "too_many_transactions"],
+    trajetEligibility({ platformIncomeOnly: false, accounts: 3, issuesClientInvoices: true }).reasons,
+    ["other_income", "too_many_accounts", "client_invoices"],
   );
+});
+
+Deno.test("Trajet : chaque critère est indépendant et les anciennes limites de comptes restent accordées", () => {
+  const ok = { platformIncomeOnly: true, accounts: 2, issuesClientInvoices: false };
+  assertEquals(trajetEligibility({ ...ok, accounts: 1 }), { eligible: true, reasons: [] });
+  assertEquals(trajetEligibility({ ...ok, accounts: 3 }).reasons, ["too_many_accounts"]);
+  assertEquals(trajetEligibility({ ...ok, platformIncomeOnly: false }).reasons, ["other_income"]);
+  assertEquals(trajetEligibility({ ...ok, issuesClientInvoices: true }).reasons, ["client_invoices"]);
+  const old = { ...terms.trajet, includedAccounts: 1 };
+  assertEquals(extraAccounts(old, 1).monthlyCents, 0);
+  assertEquals(assertThrows(() => extraAccounts(old, 2), PricingError).code, "not_eligible");
 });

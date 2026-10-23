@@ -50,7 +50,7 @@ Deno.test("tests SQL : les conditions de handle_checkout_completed suivent grant
  */
 const QUOTE = /\('(\w+)',\s*'(\{"terms".*?\})'\)/g;
 const QUOTE_DAY = "2026-10-20";
-const DRIVER = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false, monthlyTransactions: 12 };
+const DRIVER = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false };
 
 Deno.test("tests SQL : les récapitulatifs de checkout_attempts suivent quoteCheckout()", async () => {
   const sql = await Deno.readTextFile(new URL("../../../../tests/rls/checkout_attempts.test.sql", import.meta.url));

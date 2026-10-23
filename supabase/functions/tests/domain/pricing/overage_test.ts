@@ -29,6 +29,15 @@ Deno.test("compteur : le prix accordé prime sur la grille", () => {
   assertEquals(countMonth(ancien, 25).extraAmountCents, 2000);
 });
 
+Deno.test("Trajet : 20 transactions incluses, puis 4,50 $ chacune", () => {
+  const trajet = grantTerms("trajet", "monthly");
+  assertEquals(countMonth(trajet, 20).extraAmountCents, 0);
+  assertEquals(countMonth(trajet, 21).extraAmountCents, 450);
+  assertEquals(countMonth(trajet, 23).extraAmountCents, 1350);
+  // Un client de l'ancienne grille conserve son quota de 15 transactions.
+  assertEquals(countMonth({ ...trajet, includedTransactions: 15 }, 20).extraAmountCents, 2250);
+});
+
 Deno.test("compteur : sans quota (Sur mesure)", () => {
   const c = countMonth({ includedTransactions: null, extraTransactionCents: 0 }, 180);
   assertEquals(c.extraAmountCents, 0);

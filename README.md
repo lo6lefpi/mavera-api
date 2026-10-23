@@ -192,6 +192,57 @@ Seul le compteur technique de fréquence est mis à jour. Le webhook reste seul 
 de la création du dossier. Déployer la migration `20261021000100_checkout_status.sql`
 avant la fonction `public-api` ; aucune configuration supplémentaire n'est requise.
 
+### Trajet : grille 2026-10-21 et contrat du site
+
+`domain/pricing` reste la seule source des montants. Trajet comprend 20 transactions,
+2 comptes, la TPS/TVQ annuelle et QuickBooks Ledger fourni par la firme, à 59 $/mois
+avec 59 $ d'ouverture, avant taxes, sans engagement ni paiement annuel. Départ,
+Élan et Envol conservent leurs prix et inclusions. Chaque transaction au-delà des
+20 incluses coûte 4,50 $ et ne change pas l'admissibilité.
+
+Pour `POST /quote` et `POST /checkout`, envoyer les trois réponses suivantes :
+
+```json
+{
+  "planCode": "trajet",
+  "billingOption": "monthly",
+  "startMonth": "current",
+  "estimatedTransactions": 23,
+  "trajetProfile": {
+    "platformIncomeOnly": true,
+    "accounts": 2,
+    "issuesClientInvoices": false
+  }
+}
+```
+
+`/checkout` exige aussi les coordonnées, l'identifiant de tentative, les choix
+du dossier, les URL de retour et le CAPTCHA habituels. `monthlyTransactions`
+ne fait plus partie de `trajetProfile`; l'estimation reste dans
+`estimatedTransactions`. Les réponses aux trois critères sont obligatoires :
+revenus de plateformes seulement, au plus deux comptes (banque ou carte), aucune
+facture à ses propres clients. Un refus reste HTTP `422`, sous la forme
+`{ error: { code: "trajet_not_eligible", message, details } }`, où `details`
+contient uniquement `other_income`, `too_many_accounts` ou `client_invoices`.
+`too_many_transactions` n'est plus renvoyé. L'absence ou le mauvais type d'une
+réponse produit HTTP `400 invalid_request`. Une admissibilité acceptée donne le
+récapitulatif habituel sous `{ quote }`, et `/checkout` ajoute les informations
+de la session de paiement.
+
+Pour Trajet, le mois en cours coûte 135,68 $ à l'inscription (ouverture et
+premier mois, taxes comprises); le prélèvement mensuel est de 67,84 $. Un départ
+le mois suivant facture seulement 67,84 $ d'ouverture aujourd'hui. Les
+transactions supplémentaires sont facturées séparément, selon le volume réel.
+Le site affiche les montants du récapitulatif de l'API, sans les recopier.
+
+Appliquer la migration `20261021000200_pricing_grid_versions.sql` avant les
+fonctions. Elle accepte les versions `AAAA-MM` et `AAAA-MM-JJ`, sans modifier
+les conditions accordées. Relancer ensuite `scripts/stripe-sandbox-setup.ts`
+dans le bac à sable : il crée les 7 clés de la nouvelle grille, dont
+`trajet_monthly_2026_10_21`, et conserve les anciens prix. Les clients déjà
+inscrits et les récapitulatifs déjà enregistrés gardent leurs prix, quotas,
+frais d'ouverture et clés Stripe accordés.
+
 ### Tests
 
 ```sh

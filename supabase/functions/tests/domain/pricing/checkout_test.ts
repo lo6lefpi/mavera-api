@@ -60,13 +60,13 @@ Deno.test("inscription : départ le mois suivant en décembre", () => {
   assertEquals(q.commitmentEndsOn, "2028-01-01");
 });
 
-const chauffeur = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false, monthlyTransactions: 12 };
+const chauffeur = { platformIncomeOnly: true, accounts: 1, issuesClientInvoices: false };
 
-Deno.test("inscription : Trajet à 49 $ + 49 $, plus taxes", () => {
+Deno.test("inscription : Trajet à 59 $ + 59 $, plus taxes", () => {
   const q = quoteCheckout({ planCode: "trajet", billingOption: "monthly", startMonth: "current", today: TODAY, trajetProfile: chauffeur });
-  assertEquals(q.dueToday.subtotalCents, 9800);
-  // 49 $ → 2,45 $ + 4,89 $ (4,88775), deux fois
-  assertEquals(q.dueToday.totalCents, 9800 + 490 + 978);
+  assertEquals(q.dueToday.subtotalCents, 11800);
+  // 59 $ → 2,95 $ + 5,89 $ (5,88525), deux fois
+  assertEquals(q.dueToday.totalCents, 11800 + 590 + 1178);
   assertEquals(q.commitmentEndsOn, null);
 });
 
@@ -86,12 +86,12 @@ Deno.test("inscription : Trajet refusé si un critère n'est pas rempli, avec le
         billingOption: "monthly",
         startMonth: "current",
         today: TODAY,
-        trajetProfile: { ...chauffeur, accounts: 2, monthlyTransactions: 18 },
+        trajetProfile: { ...chauffeur, accounts: 3 },
       }),
     PricingError,
   );
   assertEquals(err.code, "not_eligible");
-  assertEquals(err.details, ["too_many_accounts", "too_many_transactions"]);
+  assertEquals(err.details, ["too_many_accounts"]);
 });
 
 Deno.test("inscription : les réponses Trajet n'empêchent pas un autre forfait", () => {

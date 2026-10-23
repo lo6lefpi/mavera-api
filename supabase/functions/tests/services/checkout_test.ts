@@ -25,7 +25,7 @@ test('prix mensuel courant fourni par pricing, aucun recalcul Stripe', async () 
   const result = await startCheckout(input(), { repository: repo, billing: stripe }, '2026-10-31');
   assert.equal(result.quote.dueToday.totalCents, 20466);   // 178 $ + TPS 8,90 $ + TVQ 17,76 $
   assert.equal(result.quote.recurring.nextChargeOn, '2026-11-01');
-  assert.equal(result.quote.terms.stripeRecurringLookupKey, 'depart_monthly_2026_10');
+  assert.equal(result.quote.terms.stripeRecurringLookupKey, 'depart_monthly_2026_10_21');
   assert.equal(result.quote.dueToday.lines.length, 2);
 });
 
@@ -41,7 +41,7 @@ test('Trajet non admissible ou critères absents bloqués avant paiement', async
   await assert.rejects(startCheckout(input({planCode:'trajet'}), {repository:repo, billing:stripe},'2026-10-20'));
   assert.equal(stripe.checkoutCreates, 0);
   assert.throws(() => prepareQuote(input({planCode:'trajet', trajetProfile:{
-    platformIncomeOnly:false, accounts:1, issuesClientInvoices:false,monthlyTransactions:14,
+    platformIncomeOnly:false, accounts:1, issuesClientInvoices:false,
   }}), '2026-10-20'));
 });
 
@@ -77,7 +77,7 @@ test('annuel renouvelé 12 mois plus tard, et Trajet sans annuel', () => {
   const quote = prepareQuote(input({ planCode:'envol', billingOption:'annual' }), '2026-10-20');
   assert.equal(quote.dueToday.totalCents, 297671);  // 99 $ + 2 490 $ + TPS 129,45 $ + TVQ 258,26 $
   assert.equal(quote.recurring.nextChargeOn, '2027-10-01');
-  assert.equal(quote.terms.stripeRecurringLookupKey, 'envol_annual_2026_10');
+  assert.equal(quote.terms.stripeRecurringLookupKey, 'envol_annual_2026_10_21');
   assert.throws(() => prepareQuote(input({ planCode:'trajet', billingOption:'annual' }), '2026-10-20'));
 });
 

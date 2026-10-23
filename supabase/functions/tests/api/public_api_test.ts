@@ -99,11 +99,42 @@ test('origine inconnue, mauvaise méthode, route inconnue, corps trop gros', asy
 test('Trajet non admissible : 422 avec les critères non remplis', async () => {
   const { deps } = setup();
   const res = await handlePublicApi(post('checkout', body({ planCode: 'trajet', estimatedTransactions: 14,
-    trajetProfile: { platformIncomeOnly: false, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 14 } })), deps);
+    trajetProfile: { platformIncomeOnly: false, issuesClientInvoices: false, accounts: 1 } })), deps);
   assert.equal(res.status, 422);
   const e = await error(res);
   assert.equal(e.code, 'trajet_not_eligible');
-  assert.ok(e.details && e.details.length > 0);
+  assert.deepEqual(e.details, ['other_income']);
+});
+
+test('Trajet : trois réponses, deux comptes et volume supérieur au quota acceptés en quote et checkout', async () => {
+  for (const route of ['quote', 'checkout']) {
+    const { deps } = setup();
+    const res = await handlePublicApi(post(route, body({ planCode: 'trajet', estimatedTransactions: 23,
+      trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 2 } })), deps);
+    assert.equal(res.status, 200);
+    const { quote } = await res.json();
+    assert.equal(quote.terms.gridVersion, '2026-10-21');
+    assert.equal(quote.terms.includedTransactions, 20);
+    assert.equal(quote.terms.includedAccounts, 2);
+    assert.equal(quote.dueToday.totalCents, 13568);
+    assert.equal(quote.recurring.totalCents, 6784);
+  }
+});
+
+test('Trajet : troisième compte refusé, réponses absentes ou invalides rejetées', async () => {
+  for (const route of ['quote', 'checkout']) {
+    const profile = { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 3 };
+    const { deps, stripe } = setup();
+    const refused = await handlePublicApi(post(route, body({ planCode: 'trajet', trajetProfile: profile })), deps);
+    assert.equal(refused.status, 422);
+    assert.deepEqual((await error(refused)).details, ['too_many_accounts']);
+    for (const invalid of [undefined, { ...profile, accounts: 0 }, { ...profile, accounts: 1.5 },
+      { ...profile, platformIncomeOnly: undefined }, { ...profile, issuesClientInvoices: 'non' }]) {
+      const res = await handlePublicApi(post(route, body({ planCode: 'trajet', trajetProfile: invalid })), deps);
+      assert.equal(res.status, 400);
+    }
+    assert.equal(stripe.checkoutCreates, 0);
+  }
 });
 
 test('ancien client ou refus : même réponse, le site ne révèle pas qui est client', async () => {

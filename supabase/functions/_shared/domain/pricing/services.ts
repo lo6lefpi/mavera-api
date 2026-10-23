@@ -67,7 +67,7 @@ export interface ExtraAccounts {
 /**
  * Comptes bancaires ou cartes au-delà de ceux inclus, au prix accordé
  * (15 $ par mois chacun dans la grille 2026-10).
- * Trajet exige un seul compte : au-delà, le client n'y est pas admissible.
+ * Trajet reste limité aux comptes inclus dans ses conditions accordées.
  */
 export function extraAccounts(terms: SupplementTerms, accounts: number): ExtraAccounts {
   assertCount(accounts, "accounts");
@@ -75,7 +75,7 @@ export function extraAccounts(terms: SupplementTerms, accounts: number): ExtraAc
   assertCents(terms.extraAccountCents, "extraAccountCents");
   const extra = Math.max(0, accounts - terms.includedAccounts);
   if (terms.planCode === "trajet" && extra > 0) {
-    throw new PricingError("not_eligible", "Trajet est réservé aux dossiers avec un seul compte");
+    throw new PricingError("not_eligible", `Trajet est réservé aux dossiers avec au plus ${terms.includedAccounts} compte(s)`);
   }
   return {
     includedAccounts: terms.includedAccounts,

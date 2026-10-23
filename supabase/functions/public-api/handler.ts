@@ -174,7 +174,6 @@ function parseQuote(body: Record<string, unknown>): QuoteRequest {
       platformIncomeOnly: bool(p, 'platformIncomeOnly'),
       issuesClientInvoices: bool(p, 'issuesClientInvoices'),
       accounts: int(p, 'accounts'),
-      monthlyTransactions: int(p, 'monthlyTransactions'),
     };
   }
   return {

@@ -12,12 +12,8 @@ export function prepareQuote(input: QuoteRequest, today: string): CheckoutQuote 
     const p = input.trajetProfile;
     if (!p || typeof p.platformIncomeOnly !== 'boolean' ||
         typeof p.issuesClientInvoices !== 'boolean' ||
-        !Number.isSafeInteger(p.accounts) || p.accounts < 1 ||
-        !Number.isSafeInteger(p.monthlyTransactions) || p.monthlyTransactions < 0) {
-      throw new InvalidRequestError('Les quatre critères Trajet sont obligatoires et doivent être valides');
-    }
-    if (p.monthlyTransactions !== input.estimatedTransactions) {
-      throw new InvalidRequestError('Le nombre de transactions Trajet est incohérent');
+        !Number.isSafeInteger(p.accounts) || p.accounts < 1) {
+      throw new InvalidRequestError('Les trois critères Trajet sont obligatoires et doivent être valides');
     }
   }
   // quoteCheckout vérifie l'admissibilité à Trajet (PricingError not_eligible).
@@ -94,7 +90,7 @@ export async function requestFingerprint(input: SignupInput): Promise<string> {
     input.email.trim().toLowerCase(), input.phone.trim(), input.displayName.trim(),
     input.planCode, input.billingOption, input.startMonth, input.estimatedTransactions,
     input.booksUpToDate, input.usesQuickbooks,
-    p ? [p.platformIncomeOnly, p.issuesClientInvoices, p.accounts, p.monthlyTransactions] : null,
+    p ? [p.platformIncomeOnly, p.issuesClientInvoices, p.accounts] : null,
   ]);
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');

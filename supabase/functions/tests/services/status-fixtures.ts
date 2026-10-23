@@ -7,7 +7,7 @@ export function statusFixture(planCode = 'depart'): CheckoutStatusSnapshot {
   return {
     id: '7fc50a4e-ec4b-47e3-998a-3d5f99e55b91', stripeSessionId: STATUS_SESSION,
     quote: quoteCheckout({ planCode, billingOption: 'monthly', startMonth: 'current', today: '2026-10-20',
-      trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1, monthlyTransactions: 12 } }),
+      trajetProfile: { platformIncomeOnly: true, issuesClientInvoices: false, accounts: 1 } }),
     paidAt: null, paidAmountCents: null, completedAt: null, rejectedAt: null,
     refundId: null, refundAmountCents: null, dossierExists: false,
   };
